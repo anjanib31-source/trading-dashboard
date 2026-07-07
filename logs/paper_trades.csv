@@ -1,0 +1,2 @@
+timestamp,symbol,action,entry_price,target_price,stop_loss,signals,confidence,mode
+2026-06-19T21:48:05.212602,SBIN,BUY,1035.5999755859375,1066.67,1025.24,"['MACD_bullish_crossover', 'uptrend_MA']",2,PAPER_TRADING

@@ -1,0 +1,37 @@
+# Trading Bot Configuration
+trading:
+  market_timing:
+    pre_market_start: "09:00"
+    market_start: "09:15"
+    market_end: "15:30"
+    position_entry_deadline: "14:30"  # Must enter by this time
+  
+  risk_management:
+    max_daily_loss: 2.0  # Percentage of capital
+    max_positions_per_day: 1
+    target_percent: 3.0
+    stop_loss_percent: 1.0
+  
+  analysis:
+    indicators:
+      - RSI
+      - MACD
+      - SMA_20
+      - SMA_50
+      - Bollinger_Bands
+    min_volume_threshold: 100000  # Minimum volume for stock selection
+    
+  holidays:
+    file_path: "config/holidays.txt"
+    
+broker:
+  name: "angelone"
+  api_version: "v1"
+  base_url: "https://apiconnect.angelbroking.com"
+  timeout: 30
+
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  rotation: "1 day"
+  retention: "30 days"

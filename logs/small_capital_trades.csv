@@ -1,0 +1,2 @@
+timestamp,symbol,action,quantity,entry_price,trade_value,gross_target_percent,target_price,stop_loss,fixed_costs,total_costs,net_profit,net_profit_percent,signals,confidence,capital_used,remaining_capital,mode
+2026-06-19T22:05:43.710139,SBIN,BUY,1,1035.5999755859375,1035.5999755859375,7.59,1114.24,1025.24,47.2,47.57126259124756,31.067999267578124,3.0,"['MACD_bullish_crossover', 'uptrend_MA']",2,1035.5999755859375,964.4000244140625,PAPER_TRADING_SMALL_CAP

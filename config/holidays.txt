@@ -1,0 +1,17 @@
+# Indian Stock Market Holidays 2026
+2026-01-26  # Republic Day
+2026-03-02  # Holi
+2026-03-31  # Eid-ul-Fitr
+2026-04-02  # Ram Navami
+2026-04-10  # Good Friday
+2026-04-14  # Ambedkar Jayanti
+2026-05-25  # Buddha Purnima
+2026-07-06  # Eid-ul-Adha
+2026-08-15  # Independence Day
+2026-08-28  # Janmashtami
+2026-10-02  # Gandhi Jayanti
+2026-10-21  # Dussehra
+2026-11-11  # Diwali
+2026-11-12  # Diwali (Balipratipada)
+2026-11-14  # Guru Nanak Jayanti
+2026-12-25  # Christmas

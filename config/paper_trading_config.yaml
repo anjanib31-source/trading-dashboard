@@ -1,0 +1,18 @@
+# Paper Trading Configuration
+paper_trading:
+  enabled: true
+  virtual_balance: 1000000  # ₹10 Lakhs
+  environment: "sandbox"    # Uses Angel One sandbox
+  
+  # Sandbox API endpoints
+  api_url: "https://sandboxapi.angelone.in"
+  websocket_url: "wss://sandboxfeed.angelone.in"
+  
+  # Logging
+  log_trades: true
+  log_balance: true
+  balance_check_interval: 60  # seconds
+  
+  # Reports
+  generate_daily_report: true
+  generate_weekly_report: true

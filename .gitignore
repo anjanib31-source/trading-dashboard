@@ -1,0 +1,15 @@
+# Credentials and Session data
+.env
+*.json
+*.log
+
+# Python cache and environment
+__pycache__/
+*.pyc
+venv/
+
+# Backup and Simulation scripts
+archive/
+bot_simulation.py
+bot_small_capital.py
+test_angel_login.py
