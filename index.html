@@ -2,25 +2,54 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Matrix Engine Live Tracker</title>
-    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Matrix Trading Bot - Live Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #0b0e11; color: #e9ecef; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-        .card { background-color: #161a1e; border: 1px solid #2b3139; }
-        .pulse { animation: pulse-animation 2s infinite; }
-        @keyframes pulse-animation { 0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; } }
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.3; }
+            100% { opacity: 1; }
+        }
+        .card {
+            background: rgba(31, 41, 55, 0.5);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(75, 85, 99, 0.3);
+        }
+        body {
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+            min-height: 100vh;
+        }
+        .glow {
+            text-shadow: 0 0 20px rgba(52, 211, 153, 0.3);
+        }
+        .table-row {
+            transition: all 0.2s ease;
+        }
+        .table-row:hover {
+            background: rgba(55, 65, 81, 0.3);
+        }
+        .status-badge {
+            background: rgba(52, 211, 153, 0.1);
+            border: 1px solid rgba(52, 211, 153, 0.2);
+        }
+        .status-badge-loss {
+            background: rgba(244, 63, 94, 0.1);
+            border: 1px solid rgba(244, 63, 94, 0.2);
+        }
     </style>
 </head>
-<body class="p-3 md:p-6 max-w-lg mx-auto font-sans antialiased">
-    <header class="flex justify-between items-center mb-5 border-b border-gray-800 pb-3">
+<body class="p-3 md:p-6 max-w-lg mx-auto font-sans antialiased text-gray-100">
+    <header class="flex justify-between items-center mb-6 border-b border-gray-700/50 pb-4">
         <div>
-            <div class="flex items-center gap-1.5">
-                <span class="w-2 h-2 rounded-full bg-emerald-500 pulse"></span>
-                <h1 class="text-sm font-bold tracking-wider text-emerald-400">MATRIX BOT ALIVE</h1>
+            <div class="flex items-center gap-2">
+                <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 pulse"></span>
+                <h1 class="text-base font-bold tracking-wider text-emerald-400 glow">MATRIX BOT</h1>
             </div>
-            <p class="text-[10px] text-gray-500">Sync: 01:41:34 PM</p>
+            <p class="text-[10px] text-gray-400 font-mono mt-1">Sync: 02:21:01 PM</p>
         </div>
         <div class="text-right text-[11px] font-mono text-gray-400">
             <div>Margin: <span class="text-white font-bold">₹10000.00</span></div>
@@ -28,26 +57,31 @@
         </div>
     </header>
 
-    <div class="card p-4 rounded-xl text-center mb-5 shadow-lg">
+    <div class="card p-4 rounded-xl text-center mb-6 shadow-lg">
         <p class="text-[10px] text-gray-400 uppercase tracking-widest font-semibold">Today's Floating P&L</p>
         <p class="text-3xl font-extrabold font-mono mt-1 text-emerald-400">
-            +₹0.00 <span class="text-lg font-medium">(+0.00%)</span>
+            +₹0.00 <span class="text-base font-medium">(+0.00%)</span>
         </p>
+        <div class="flex justify-center gap-6 mt-3 text-xs text-gray-400">
+            <span>Active: <span class="text-white font-bold">0</span></span>
+            <span>Trades Today: <span class="text-white font-bold">0</span></span>
+        </div>
     </div>
 
     <section class="mb-6">
-        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-3">Active Tactical Holdings (0)</h2>
+        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-3">Active Positions</h2>
         <div class="space-y-3" id="positions-root"></div>
     </section>
 
-    <section class="mb-10">
-        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-2">Today's Closed Battle Log</h2>
+    <section class="mb-6">
+        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-2">Recent Trades</h2>
         <div class="card rounded-xl overflow-hidden text-xs">
             <table class="w-full text-left font-mono">
-                <thead class="bg-gray-800 text-[10px] text-gray-400 border-b border-gray-700">
+                <thead class="bg-gray-800/50 text-[10px] text-gray-400 border-b border-gray-700/50">
                     <tr>
                         <th class="p-2.5">Symbol</th>
                         <th class="p-2.5">P&L</th>
+                        <th class="p-2.5 hidden md:table-cell">Strategy</th>
                         <th class="p-2.5 text-right">Status</th>
                     </tr>
                 </thead>
@@ -62,27 +96,35 @@
         
         const posRoot = document.getElementById('positions-root');
         if (positionsData.length === 0) {
-            posRoot.innerHTML = `<div class="card p-6 rounded-xl text-center text-xs text-gray-500 font-mono">No active tactical positions held. Engine running indicators sweep...</div>`;
+            posRoot.innerHTML = `<div class="card p-6 rounded-xl text-center text-xs text-gray-500 font-mono">No active positions</div>`;
         } else {
             positionsData.forEach(pos => {
                 const isProfit = pos.pnl >= 0;
                 const pnlColor = isProfit ? 'text-emerald-400' : 'text-rose-500';
-                const totalRange = pos.target_price - pos.sl_price;
-                const progressPct = totalRange > 0 ? Math.min(100, Math.max(0, ((pos.live_price - pos.sl_price) / totalRange) * 100)) : 50;
-
+                const progressPct = ((pos.live_price - pos.sl) / (pos.target - pos.sl) * 100).toFixed(0);
+                
                 posRoot.innerHTML += `
-                    <div class="card p-3.5 rounded-xl flex flex-col justify-between">
+                    <div class="card p-3.5 rounded-xl">
                         <div class="flex justify-between items-start">
                             <div>
                                 <div class="flex items-center gap-1.5">
-                                    <h3 class="text-base font-bold tracking-tight text-white">${pos.symbol}</h3>
-                                    <span class="bg-gray-800 text-gray-400 font-mono text-[9px] px-1.5 py-0.5 rounded font-bold">${pos.strategy}</span>
+                                    <h3 class="text-base font-bold text-white">${pos.symbol}</h3>
+                                    <span class="bg-gray-700/50 text-gray-300 font-mono text-[9px] px-1.5 py-0.5 rounded font-bold">${pos.strategy}</span>
                                 </div>
-                                <p class="text-[11px] text-gray-400 mt-0.5 font-mono">Qty: ${pos.quantity} | Entry: ₹${pos.entry_price} | Live: ₹${pos.live_price}</p>
+                                <p class="text-[10px] text-gray-400 mt-0.5 font-mono">Qty: ${pos.quantity} | Entry: ₹${pos.entry_price} | Live: ₹${pos.live_price}</p>
                             </div>
                             <div class="text-right font-mono">
                                 <span class="text-sm font-bold ${pnlColor}">${pos.pnl >= 0 ? '+' : ''}₹${pos.pnl}</span>
                                 <div class="text-[10px] ${pnlColor}">(${pos.pnl_pct >= 0 ? '+' : ''}${pos.pnl_pct}%)</div>
+                            </div>
+                        </div>
+                        <div class="mt-2">
+                            <div class="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                                <div class="h-full bg-gradient-to-r from-rose-500 via-yellow-500 to-emerald-500 rounded-full" style="width: ${Math.min(100, Math.max(0, progressPct))}%"></div>
+                            </div>
+                            <div class="flex justify-between text-[9px] text-gray-500 mt-0.5 font-mono">
+                                <span>SL: ₹${pos.sl}</span>
+                                <span>Target: ₹${pos.target}</span>
                             </div>
                         </div>
                     </div>`;
@@ -91,15 +133,17 @@
 
         const tableRoot = document.getElementById('history-table-root');
         if (historicalTrades.length === 0) {
-            tableRoot.innerHTML = `<tr><td colspan="3" class="p-4 text-center text-gray-500 italic">No closed trades recorded during this session.</td></tr>`;
+            tableRoot.innerHTML = `<tr><td colspan="4" class="p-4 text-center text-gray-500 italic">No trades yet today</td></tr>`;
         } else {
             historicalTrades.forEach(t => {
                 const pnlColor = t.net_pnl >= 0 ? 'text-emerald-400' : 'text-rose-500';
+                const statusClass = t.net_pnl >= 0 ? 'status-badge' : 'status-badge-loss';
                 tableRoot.innerHTML += `
-                    <tr class="border-b border-gray-800 hover:bg-gray-800/40 transition">
-                        <td class="p-2.5 font-bold text-white">${t.symbol}<div class="text-[9px] text-gray-500 font-normal">${t.strategy}</div></td>
-                        <td class="p-2.5 ${pnlColor} font-bold">${t.net_pnl >= 0 ? '+' : ''}₹${t.net_pnl.toFixed(2)}</td>
-                        <td class="p-2.5 text-right font-semibold">${t.exit_status}</td>
+                    <tr class="table-row border-b border-gray-700/30">
+                        <td class="p-2.5 font-bold text-white">${t.symbol}</td>
+                        <td class="p-2.5 ${pnlColor} font-bold">${t.net_pnl >= 0 ? '+' : ''}₹${parseFloat(t.net_pnl).toFixed(2)}</td>
+                        <td class="p-2.5 hidden md:table-cell text-gray-400">${t.strategy || 'N/A'}</td>
+                        <td class="p-2.5 text-right"><span class="${statusClass} px-2 py-0.5 rounded-full text-[9px] font-semibold">${t.exit_status || 'Closed'}</span></td>
                     </tr>`;
             });
         }
