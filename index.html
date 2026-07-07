@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <!-- AUTO-REFRESH EVERY 30 SECONDS - WORKS ON ALL DEVICES -->
+    <meta http-equiv="refresh" content="30">
     <title>Matrix Trading Bot - Live Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -40,6 +42,12 @@
             background: rgba(244, 63, 94, 0.1);
             border: 1px solid rgba(244, 63, 94, 0.2);
         }
+        .refresh-indicator {
+            font-size: 8px;
+            color: rgba(255,255,255,0.3);
+            text-align: center;
+            margin-top: 20px;
+        }
     </style>
 </head>
 <body class="p-3 md:p-6 max-w-lg mx-auto font-sans antialiased text-gray-100">
@@ -49,7 +57,7 @@
                 <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 pulse"></span>
                 <h1 class="text-base font-bold tracking-wider text-emerald-400 glow">MATRIX BOT</h1>
             </div>
-            <p class="text-[10px] text-gray-400 font-mono mt-1">Sync: 03:32:13 PM</p>
+            <p class="text-[10px] text-gray-400 font-mono mt-1">Sync: 03:38:40 PM</p>
         </div>
         <div class="text-right text-[11px] font-mono text-gray-400">
             <div>Margin: <span class="text-white font-bold">₹10000.00</span></div>
@@ -89,6 +97,11 @@
             </table>
         </div>
     </section>
+
+    <!-- Auto-refresh status indicator -->
+    <div class="refresh-indicator">
+        🔄 Auto-refresh every 30s | Bot is ACTIVE 🟢
+    </div>
 
     <script>
         const positionsData = [];
