@@ -75,11 +75,11 @@
                 <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 pulse"></span>
                 <h1 class="text-base font-bold tracking-wider text-emerald-400 glow">MATRIX BOT</h1>
             </div>
-            <p class="text-[10px] text-gray-400 font-mono mt-1">Sync: 11:01:02 AM</p>
+            <p class="text-[10px] text-gray-400 font-mono mt-1">Sync: 11:02:09 AM</p>
         </div>
         <div class="text-right text-[11px] font-mono text-gray-400">
             <div>Margin: <span class="text-white font-bold">₹7670.08</span></div>
-            <div>Value: <span class="text-white font-bold">₹9998.92</span></div>
+            <div>Value: <span class="text-white font-bold">₹9996.32</span></div>
         </div>
     </header>
 
@@ -88,9 +88,9 @@
         <div class="flex items-center justify-between">
             <div class="flex items-center">
                 <span class="status-dot green"></span>
-                <span class="text-xs font-mono" id="scan-status">⏸️ Max positions (3) reached (20m ago) | Signals: </span>
+                <span class="text-xs font-mono" id="scan-status">⏸️ Max positions (3) reached (21m ago) | Signals: </span>
             </div>
-            <span class="text-[10px] text-gray-500">Market: ➡️ CONSOLIDATION (-0.03%)</span>
+            <span class="text-[10px] text-gray-500">Market: ➡️ CONSOLIDATION (-0.10%)</span>
         </div>
         <div class="flex justify-between mt-1.5 text-[10px] text-gray-500">
             <span>Scans: 74</span>
@@ -102,7 +102,7 @@
     <div class="card p-4 rounded-xl text-center mb-5 shadow-lg">
         <p class="text-[10px] text-gray-400 uppercase tracking-widest font-semibold">Today's Floating P&L</p>
         <p class="text-3xl font-extrabold font-mono mt-1 text-rose-500">
-            ₹1.08 <span class="text-base font-medium">(0.01%)</span>
+            ₹3.68 <span class="text-base font-medium">(0.04%)</span>
         </p>
         <div class="flex justify-center gap-6 mt-2 text-xs text-gray-400">
             <span>Active: <span class="text-white font-bold">3</span></span>
@@ -137,7 +137,7 @@
     </div>
 
     <script>
-        const positionsData = [{"symbol": "AARTISURF", "strategy": "Trend-Follow", "quantity": 8, "entry_price": 379.6, "live_price": 379.2, "pnl": -3.2, "pnl_pct": -0.11, "target": 392.89, "sl": 372.01}, {"symbol": "AAVAS", "strategy": "Trend-Follow", "quantity": 2, "entry_price": 1508.9, "live_price": 1509.5, "pnl": 1.2, "pnl_pct": 0.04, "target": 1561.71, "sl": 1478.72}, {"symbol": "AARVI", "strategy": "Trend-Follow", "quantity": 23, "entry_price": 141.96, "live_price": 142.0, "pnl": 0.92, "pnl_pct": 0.03, "target": 146.93, "sl": 139.12}];
+        const positionsData = [{"symbol": "AARTISURF", "strategy": "Trend-Follow", "quantity": 8, "entry_price": 379.6, "live_price": 379.2, "pnl": -3.2, "pnl_pct": -0.11, "target": 392.89, "sl": 372.01}, {"symbol": "AAVAS", "strategy": "Trend-Follow", "quantity": 2, "entry_price": 1508.9, "live_price": 1508.2, "pnl": -1.4, "pnl_pct": -0.05, "target": 1561.71, "sl": 1478.72}, {"symbol": "AARVI", "strategy": "Trend-Follow", "quantity": 23, "entry_price": 141.96, "live_price": 142.0, "pnl": 0.92, "pnl_pct": 0.03, "target": 146.93, "sl": 139.12}];
         const historicalTrades = [];
         
         const posRoot = document.getElementById('positions-root');
