@@ -61,7 +61,7 @@
 </head>
 <body class="font-sans antialiased text-gray-100">
 
-    <!-- ===== HEADER ===== -->
+    <!-- HEADER -->
     <header class="p-3 flex justify-between items-center border-b border-gray-700/50 sticky top-0 bg-[#0f0f1a]/90 backdrop-blur-md z-50">
         <div>
             <div class="flex items-center gap-2">
@@ -84,17 +84,13 @@
         </div>
     </header>
 
-    <!-- ===== PAGES ===== -->
-
     <!-- PAGE 1: OVERVIEW -->
     <div id="page-overview" class="page active p-3">
-        <!-- Market Status -->
         <div class="card p-2 rounded-xl mb-3 flex justify-between items-center text-[10px]">
             <span id="market-status">Market: Loading...</span>
             <span>Scans: <span id="scan-count">0</span> | Signals: <span id="signal-count">0</span></span>
         </div>
 
-        <!-- Today's P&L -->
         <div class="card p-4 rounded-xl text-center mb-3">
             <p class="text-[8px] text-gray-400 uppercase tracking-widest">Today's Floating P&L</p>
             <p class="text-2xl font-extrabold font-mono mt-1" id="today-pnl">₹0.00</p>
@@ -104,7 +100,6 @@
             </div>
         </div>
 
-        <!-- Compact Stats -->
         <div class="compact-grid mb-3">
             <div class="compact-stat">
                 <div class="value" id="total-pnl">₹0</div>
@@ -124,7 +119,6 @@
             </div>
         </div>
 
-        <!-- Top Performers -->
         <div class="card p-2 rounded-xl mb-3">
             <p class="text-[8px] text-gray-400 uppercase tracking-wider mb-1">🏆 Top Stocks</p>
             <div id="top-performers" class="flex flex-wrap gap-1">
@@ -132,7 +126,6 @@
             </div>
         </div>
 
-        <!-- Quick Actions -->
         <div class="grid grid-cols-3 gap-2">
             <button onclick="switchPage('positions')" class="card p-2 rounded-xl text-center text-[9px] text-gray-400 hover:text-white transition">
                 📊 Positions
@@ -175,7 +168,6 @@
             </div>
         </div>
 
-        <!-- Daily -->
         <div id="tab-daily" class="tab-content active">
             <div class="card p-2 rounded-xl">
                 <div class="chart-container"><canvas id="dailyChart"></canvas></div>
@@ -188,7 +180,6 @@
             </div>
         </div>
 
-        <!-- Weekly -->
         <div id="tab-weekly" class="tab-content">
             <div class="card p-2 rounded-xl">
                 <div class="chart-container"><canvas id="weeklyChart"></canvas></div>
@@ -201,7 +192,6 @@
             </div>
         </div>
 
-        <!-- Monthly -->
         <div id="tab-monthly" class="tab-content">
             <div class="card p-2 rounded-xl">
                 <div class="chart-container"><canvas id="monthlyChart"></canvas></div>
@@ -215,7 +205,7 @@
         </div>
     </div>
 
-    <!-- ===== BOTTOM NAVIGATION ===== -->
+    <!-- BOTTOM NAVIGATION -->
     <nav class="bottom-nav">
         <button class="nav-item active" data-page="overview" onclick="switchPage('overview')">
             <span class="nav-icon">🏠</span>

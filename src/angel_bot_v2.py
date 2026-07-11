@@ -2,6 +2,8 @@ from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 import pyotp
 import json
+import csv
+import io
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -12,7 +14,11 @@ import logging
 import os
 import sys
 import threading
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+import base64
+import math
 
 try:
     import nsepython
@@ -20,40 +26,57 @@ try:
 except ImportError:
     NSEPYTHON_AVAILABLE = False
 
-# === CONFIGURATION & CREDENTIALS ===
-import os
-from dotenv import load_dotenv
-
-# Load variables from the .env file located in the same directory
+# === LOAD ENVIRONMENT VARIABLES ===
 load_dotenv()
 
+# === API CREDENTIALS ===
 API_KEY = os.getenv("API_KEY")
 CLIENT_CODE = os.getenv("CLIENT_CODE")
 MPIN = os.getenv("MPIN")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
 
-# === GITHUB SYNCHRONIZATION CONSTANTS ===
+# === GITHUB SYNCHRONIZATION ===
 GITHUB_PAT = os.getenv("GITHUB_PAT")
-GITHUB_USERNAME = "anjanib31-source" # This is safe to keep here
-GITHUB_REPO = "trading-dashboard"   # This is safe to keep here
+GITHUB_USERNAME = "anjanib31-source"
+GITHUB_REPO = "trading-dashboard"
+
+# === DATABASE ===
+DB_NAME = "trades.db"
 
 # === TRADING PARAMETERS ===
 CAPITAL = 10000
 MAX_POSITIONS = 3
 LEVERAGE = 4
 STOP_LOSS = 0.02
-TRAILING_SL_ACTIVATION = 0.015  
-TRAILING_SL_PULLBACK = 0.007    
+TRAILING_SL_ACTIVATION = 0.015
+TRAILING_SL_PULLBACK = 0.007
 MAX_HOLD_MINUTES = 90
 SCAN_INTERVAL = 45
 
+# === PROFIT TARGETS ===
 PROFIT_TARGETS = {8: 0.035, 9: 0.040, 10: 0.045}
 DEFAULT_PROFIT_TARGET = 0.030
 MIN_SIGNAL_SCORE = 7
 
+# === PARTIAL PROFIT TAKING ===
+ENABLE_PARTIAL_EXIT = True
+PARTIAL_EXIT_LEVEL_1 = 0.015
+PARTIAL_EXIT_LEVEL_2 = 0.025
+PARTIAL_EXIT_LEVEL_3 = 0.035
+
+# === RISK MANAGEMENT ===
+ENABLE_ROBO_ORDERS = True
+ENABLE_DYNAMIC_SL = True
+ENABLE_ATR_POSITION_SIZING = True
+ENABLE_CORRELATION_FILTER = True
+ENABLE_SECTOR_DIVERSIFICATION = True
+ENABLE_VOLATILITY_STOP = True
+MAX_SECTOR_EXPOSURE = 0.40
+MAX_CORRELATION_THRESHOLD = 0.70
+
 # === STOCK SELECTION ===
-AUTO_PICK_STOCKS = False  
-MAX_STOCKS_TO_SCAN = 40  
+AUTO_PICK_STOCKS = False
+MAX_STOCKS_TO_SCAN = 40
 MIN_STOCK_PRICE = 20
 MAX_STOCK_PRICE = 4000
 
@@ -68,6 +91,10 @@ ORB_MINUTES = 15
 WAKE_UP_TIME = "09:15"
 TRADING_START = "09:30"
 MARKET_CLOSE = "15:30"
+SQUARE_OFF_BUFFER = 5
+
+# === MAX DAILY LOSS ===
+MAX_DAILY_LOSS = 0.05
 
 # === SETUP LOGGING ===
 os.makedirs("logs", exist_ok=True)
@@ -81,6 +108,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# DATABASE FUNCTIONS
+# ============================================================
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_database():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                entry_price REAL,
+                exit_price REAL,
+                quantity INTEGER,
+                gross_pnl REAL,
+                net_pnl REAL,
+                strategy TEXT,
+                exit_reason TEXT,
+                entry_time TEXT,
+                exit_time TEXT,
+                exit_type TEXT DEFAULT 'FULL'
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                entry_price REAL,
+                quantity INTEGER,
+                strategy TEXT,
+                entry_time TEXT,
+                status TEXT DEFAULT 'OPEN'
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("[DB] Database initialized successfully")
+    except Exception as e:
+        logger.error(f"[DB] Error initializing database: {e}")
+
+
+# ============================================================
+# MAIN BOT CLASS
+# ============================================================
 
 class AngelTradingBot:
     def __init__(self):
@@ -104,8 +185,63 @@ class AngelTradingBot:
         self.bulk_data_store = {}  
         self.stock_list = []
         self.running = True
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.trades = []
+        self.daily_pnl = 0.0
+        self.total_trades_today = 0
+        
+        self.sector_map = {}
+        self.sector_exposure = {}
+        self.correlation_matrix = {}
+        self.atr_cache = {}
+        self.volatility_cache = {}
+        self.indicator_cache = {}
+        
+        self.scan_count = 0
+        self.signals_found = 0
+        self.stocks_scored = 0
+        self.last_scan_time = None
+        self.scan_status = "🔄 Bot Initializing..."
+        self.market_condition = "Unknown"
+
+    # ============================================================
+    # DATABASE: SAVE TRADE
+    # ============================================================
+    
+    def save_trade(self, trade_data):
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO trades (
+                    symbol, entry_price, exit_price, quantity,
+                    gross_pnl, net_pnl, strategy, exit_reason,
+                    entry_time, exit_time, exit_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                trade_data.get('symbol', ''),
+                trade_data.get('entry_price', 0),
+                trade_data.get('exit_price', 0),
+                trade_data.get('quantity', 0),
+                trade_data.get('gross_pnl', 0),
+                trade_data.get('net_pnl', 0),
+                trade_data.get('strategy', ''),
+                trade_data.get('exit_reason', ''),
+                trade_data.get('entry_time', datetime.now().isoformat()),
+                trade_data.get('exit_time', datetime.now().isoformat()),
+                trade_data.get('exit_type', 'FULL')
+            ))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"[DB] Trade saved: {trade_data.get('symbol', 'Unknown')}")
+        except Exception as e:
+            logger.error(f"[DB] Error saving trade: {e}")
+
+    # ============================================================
+    # LOGIN & AUTHENTICATION
+    # ============================================================
 
     def login(self):
         try:
@@ -163,6 +299,10 @@ class AngelTradingBot:
         except Exception as e:
             logger.error(f"[CRITICAL] Failed to read or parse local JSON file: {e}")
             return {}
+
+    # ============================================================
+    # WEB SOCKET 2.0
+    # ============================================================
 
     def start_websocket(self):
         def run_loop():
@@ -232,19 +372,470 @@ class AngelTradingBot:
             except Exception as e:
                 logger.error(f"[WS] Subscription Error Payload: {e}")
 
+    def check_ws_health(self):
+        if not self.ws_connected:
+            logger.warning("[WS] WebSocket disconnected! Attempting reconnect...")
+            return self._reconnect_websocket()
+        
+        if self.stock_list:
+            stale_count = 0
+            for symbol in self.stock_list[:5]:
+                if symbol in self.price_update_time:
+                    age = (datetime.now() - self.price_update_time[symbol]).total_seconds()
+                    if age > 10:
+                        stale_count += 1
+            
+            if stale_count >= 3:
+                logger.warning(f"[WS] {stale_count}/5 prices stale. Reconnecting...")
+                return self._reconnect_websocket()
+        
+        return True
+
+    def _reconnect_websocket(self):
+        try:
+            if self.sws:
+                try:
+                    self.sws.close_connection()
+                except:
+                    pass
+            
+            self.start_websocket()
+            time.sleep(3)
+            
+            if self.ws_connected and self.stock_list:
+                self.subscribe_to_stocks()
+                logger.info("[WS] Reconnected and resubscribed successfully!")
+                return True
+            else:
+                logger.error("[WS] Reconnection failed!")
+                return False
+        except Exception as e:
+            logger.error(f"[WS] Reconnection error: {e}")
+            return False
+
+    # ============================================================
+    # DUAL DATA SOURCE: ANGEL ONE API + YAHOO FINANCE
+    # ============================================================
+
+    def get_indicator_data(self, symbol, period="5d", interval="15m"):
+        """
+        Fetch historical data - Angel One API (Primary) + Yahoo Finance (Fallback)
+        """
+        try:
+            cache_key = f"{symbol}_{period}_{interval}"
+            
+            # Check cache first
+            with self.lock:
+                if cache_key in self.indicator_cache:
+                    cache_time, data = self.indicator_cache[cache_key]
+                    if (datetime.now() - cache_time).seconds < 60:
+                        logger.debug(f"[CACHE] Using cached data for {symbol}")
+                        return data
+            
+            # === PRIMARY: Angel One Historical API ===
+            try:
+                logger.info(f"[ANGEL API] Fetching data for {symbol}...")
+                
+                token = self.symbol_tokens.get(symbol)
+                if not token:
+                    logger.warning(f"[ANGEL API] Token not found for {symbol}")
+                    raise Exception("Token not found")
+                
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=5)
+                
+                fromdate = start_date.strftime("%Y-%m-%d")
+                todate = end_date.strftime("%Y-%m-%d")
+                
+                historical_data = self.obj.getCandleData(
+                    exchange="NSE",
+                    symboltoken=token,
+                    interval="FIFTEEN_MINUTE",
+                    fromdate=fromdate,
+                    todate=todate
+                )
+                
+                if historical_data and historical_data.get('status') == True:
+                    data = self._parse_angel_historical_data(historical_data)
+                    
+                    if data is not None and not data.empty:
+                        with self.lock:
+                            self.indicator_cache[cache_key] = (datetime.now(), data)
+                        
+                        logger.info(f"[ANGEL API] Successfully fetched data for {symbol}")
+                        return data
+                    else:
+                        logger.warning(f"[ANGEL API] Empty data for {symbol}")
+                else:
+                    logger.warning(f"[ANGEL API] API returned error for {symbol}")
+                    
+            except Exception as e:
+                logger.warning(f"[ANGEL API] Failed for {symbol}: {e}")
+            
+            # === FALLBACK: Yahoo Finance ===
+            try:
+                logger.warning(f"[YAHOO FALLBACK] Fetching data for {symbol}...")
+                
+                stock = yf.Ticker(f"{symbol}.NS")
+                data = stock.history(period=period, interval=interval)
+                
+                if not data.empty and len(data) > 10:
+                    data = data.tail(100).copy()
+                    
+                    with self.lock:
+                        self.indicator_cache[cache_key] = (datetime.now(), data)
+                    
+                    logger.info(f"[YAHOO FALLBACK] Successfully fetched data for {symbol}")
+                    return data
+                else:
+                    logger.warning(f"[YAHOO FALLBACK] Empty data for {symbol}")
+                    
+            except Exception as e:
+                logger.warning(f"[YAHOO FALLBACK] Failed for {symbol}: {e}")
+            
+            # === EMERGENCY: Bulk Data Store ===
+            if symbol in self.bulk_data_store:
+                logger.warning(f"[EMERGENCY] Using bulk data for {symbol}")
+                return self.bulk_data_store[symbol]
+            
+            logger.warning(f"[FAILED] No data available for {symbol}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"[ERROR] get_indicator_data failed for {symbol}: {e}")
+            return None
+
+    def _parse_angel_historical_data(self, historical_data):
+        try:
+            if not historical_data or 'data' not in historical_data:
+                return None
+            
+            data_list = historical_data['data']
+            
+            if not data_list or len(data_list) < 2:
+                return None
+            
+            df = pd.DataFrame(data_list, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            
+            df['Open'] = df['Open'].astype(float)
+            df['High'] = df['High'].astype(float)
+            df['Low'] = df['Low'].astype(float)
+            df['Close'] = df['Close'].astype(float)
+            df['Volume'] = df['Volume'].astype(float)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Parsing Angel One historical data: {e}")
+            return None
+
+    # ============================================================
+    # RISK MANAGEMENT
+    # ============================================================
+
+    def load_sector_mapping(self):
+        self.sector_map = {
+            "HDFCBANK": "BANKING", "ICICIBANK": "BANKING", "SBIN": "BANKING",
+            "AXISBANK": "BANKING", "KOTAKBANK": "BANKING", "INDUSINDBK": "BANKING",
+            "PNB": "BANKING", "BANKBARODA": "BANKING", "CANBK": "BANKING",
+            "FEDERALBNK": "BANKING", "IDFCFIRSTB": "BANKING", "RBLBANK": "BANKING",
+            "TCS": "IT", "INFY": "IT", "WIPRO": "IT", "HCLTECH": "IT",
+            "TECHM": "IT", "LTTS": "IT", "MINDTREE": "IT", "PERSISTENT": "IT",
+            "MPHASIS": "IT", "ZENSARTECH": "IT", "CYIENT": "IT",
+            "HINDUNILVR": "FMCG", "ITC": "FMCG", "BRITANNIA": "FMCG",
+            "NESTLEIND": "FMCG", "DABUR": "FMCG", "MARICO": "FMCG",
+            "GODREJCP": "FMCG", "TATACONSUM": "FMCG", "JUBLFOOD": "FMCG",
+            "MARUTI": "AUTO", "M&M": "AUTO", "TATAMOTORS": "AUTO",
+            "ASHOKLEY": "AUTO", "HEROMOTOCO": "AUTO", "EICHERMOT": "AUTO",
+            "BAJAJ-AUTO": "AUTO", "MOTHERSON": "AUTO", "EXIDEIND": "AUTO",
+            "TATASTEEL": "METALS", "JSWSTEEL": "METALS", "HINDALCO": "METALS",
+            "VEDL": "METALS", "SAIL": "METALS", "NATIONALUM": "METALS",
+            "NMDC": "METALS", "JINDALSTEL": "METALS",
+            "SUNPHARMA": "PHARMA", "DRREDDY": "PHARMA", "CIPLA": "PHARMA",
+            "DIVISLAB": "PHARMA", "LUPIN": "PHARMA", "BIOCON": "PHARMA",
+            "AUROPHARMA": "PHARMA", "TORNTPHARM": "PHARMA", "ZYDUSLIFE": "PHARMA",
+            "RELIANCE": "OIL_GAS", "ONGC": "OIL_GAS", "BPCL": "OIL_GAS",
+            "IOCL": "OIL_GAS", "HINDPETRO": "OIL_GAS", "GAIL": "OIL_GAS",
+            "PETRONET": "OIL_GAS", "OIL": "OIL_GAS",
+            "NTPC": "POWER", "POWERGRID": "POWER", "TATAPOWER": "POWER",
+            "ADANIPOWER": "POWER", "NHPC": "POWER", "SJVN": "POWER",
+            "PFC": "POWER", "RECLTD": "POWER", "IRFC": "POWER",
+            "LT": "INFRA", "SIEMENS": "INFRA", "ABB": "INFRA", "BHEL": "INFRA",
+            "L&T": "INFRA", "NCC": "INFRA", "GMRINFRA": "INFRA", "IRB": "INFRA",
+            "BHARTIARTL": "TELECOM", "IDEA": "TELECOM",
+            "TITAN": "CONSUMER", "BAJFINANCE": "FINANCE", "HDFCLIFE": "INSURANCE",
+            "SBILIFE": "INSURANCE", "ICICIPRULI": "INSURANCE", "HDFCAMC": "FINANCE",
+            "MUTHOOTFIN": "FINANCE", "CHOLAFIN": "FINANCE", "SRTRANSFIN": "FINANCE"
+        }
+        logger.info(f"[SECTOR] Loaded {len(self.sector_map)} sector mappings")
+
+    def get_sector(self, symbol):
+        return self.sector_map.get(symbol, "OTHER")
+
+    def check_correlation(self, symbol):
+        if not ENABLE_CORRELATION_FILTER or not self.positions:
+            return True
+        
+        for pos in self.positions:
+            corr = self.calculate_correlation(symbol, pos['symbol'])
+            if corr > MAX_CORRELATION_THRESHOLD:
+                logger.info(f"[CORRELATION FILTER] {symbol} correlated with {pos['symbol']} ({corr:.2f})")
+                return False
+        
+        return True
+
+    def calculate_correlation(self, symbol1, symbol2):
+        try:
+            data1 = self.bulk_data_store.get(symbol1)
+            data2 = self.bulk_data_store.get(symbol2)
+            
+            if data1 is None or data2 is None:
+                return 0.0
+            
+            close1 = data1['Close'].tail(20)
+            close2 = data2['Close'].tail(20)
+            
+            if len(close1) < 10 or len(close2) < 10:
+                return 0.0
+            
+            returns1 = close1.pct_change().dropna()
+            returns2 = close2.pct_change().dropna()
+            
+            common_idx = returns1.index.intersection(returns2.index)
+            if len(common_idx) < 5:
+                return 0.0
+            
+            corr = returns1.loc[common_idx].corr(returns2.loc[common_idx])
+            return abs(corr)
+        except:
+            return 0.0
+
+    def check_sector_exposure(self, symbol):
+        if not ENABLE_SECTOR_DIVERSIFICATION:
+            return True
+        
+        sector = self.get_sector(symbol)
+        
+        sector_exposure = 0.0
+        for pos in self.positions:
+            pos_sector = self.get_sector(pos['symbol'])
+            if pos_sector == sector:
+                pos_value = pos['entry_price'] * pos['quantity']
+                sector_exposure += pos_value
+        
+        total_capital = self.capital
+        if sector_exposure / total_capital > MAX_SECTOR_EXPOSURE:
+            logger.info(f"[SECTOR FILTER] {sector} exposure {sector_exposure/total_capital*100:.1f}% > {MAX_SECTOR_EXPOSURE*100}%")
+            return False
+        
+        return True
+
+    def calculate_atr(self, symbol, period=14):
+        try:
+            data = self.bulk_data_store.get(symbol)
+            if data is None or len(data) < period:
+                return None
+            
+            high = data['High']
+            low = data['Low']
+            close = data['Close']
+            
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean().iloc[-1]
+            
+            return atr
+        except:
+            return None
+
+    def calculate_atr_position_size(self, symbol, price):
+        if not ENABLE_ATR_POSITION_SIZING:
+            return None
+        
+        atr = self.calculate_atr(symbol)
+        if atr is None or atr == 0:
+            return None
+        
+        risk_amount = self.capital * 0.01
+        qty = int(risk_amount / (atr * 1.5))
+        qty = max(1, qty)
+        
+        max_qty = int((self.available_capital * LEVERAGE) / price)
+        qty = min(qty, max_qty)
+        
+        logger.info(f"[ATR SIZING] {symbol}: ATR={atr:.2f}, Qty={qty}")
+        return qty
+
+    def get_dynamic_stop_loss(self, symbol, entry_price):
+        if not ENABLE_DYNAMIC_SL:
+            return STOP_LOSS
+        
+        atr = self.calculate_atr(symbol)
+        if atr is None or atr == 0:
+            return STOP_LOSS
+        
+        sl_pct = (atr * 2) / entry_price
+        sl_pct = min(max(sl_pct, 0.01), 0.05)
+        
+        logger.info(f"[DYNAMIC SL] {symbol}: SL={sl_pct*100:.2f}%")
+        return sl_pct
+
+    def get_volatility_stop(self, symbol, entry_price):
+        if not ENABLE_VOLATILITY_STOP:
+            return STOP_LOSS
+        
+        try:
+            data = self.bulk_data_store.get(symbol)
+            if data is None or len(data) < 20:
+                return STOP_LOSS
+            
+            returns = data['Close'].pct_change().dropna()
+            volatility = returns.std() * math.sqrt(252)
+            
+            self.volatility_cache[symbol] = volatility
+            
+            if volatility > 0.50:
+                sl_pct = 0.03
+            elif volatility > 0.30:
+                sl_pct = 0.025
+            else:
+                sl_pct = 0.02
+            
+            logger.info(f"[VOLATILITY SL] {symbol}: Vol={volatility*100:.1f}%, SL={sl_pct*100:.2f}%")
+            return sl_pct
+        except:
+            return STOP_LOSS
+
+    # ============================================================
+    # GET LTP WITH FALLBACK
+    # ============================================================
+
     def get_ltp(self, symbol):
         with self.lock:
             if symbol in self.live_prices:
-                return self.live_prices[symbol]
-                
+                if symbol in self.price_update_time:
+                    age = (datetime.now() - self.price_update_time[symbol]).total_seconds()
+                    if age < 5:
+                        return self.live_prices[symbol]
+        
+        try:
+            stock = yf.Ticker(f"{symbol}.NS")
+            data = stock.history(period="1d", interval="1m")
+            if not data.empty:
+                price = float(data['Close'].iloc[-1])
+                with self.lock:
+                    self.live_prices[symbol] = price
+                    self.price_update_time[symbol] = datetime.now()
+                logger.info(f"[FALLBACK] {symbol}: ₹{price:.2f} from Yahoo")
+                return price
+        except Exception as e:
+            logger.debug(f"[FALLBACK] Yahoo failed for {symbol}: {e}")
+        
         if symbol in self.bulk_data_store:
             df = self.bulk_data_store[symbol]
             if df is not None and not df.empty:
                 try:
                     return float(df['Close'].iloc[-1])
-                except Exception:
+                except:
                     pass
+        
+        for pos in self.positions:
+            if pos['symbol'] == symbol:
+                logger.warning(f"[EMERGENCY] Using entry price for {symbol}")
+                return pos['entry_price']
+        
+        logger.warning(f"[PRICE] No price available for {symbol}")
         return None
+
+    # ============================================================
+    # SQUARE OFF & RISK CHECKS
+    # ============================================================
+
+    def check_and_square_off(self):
+        now = datetime.now()
+        current_time = now.time()
+        close_time = datetime.strptime(MARKET_CLOSE, "%H:%M").time()
+        square_off_time = (datetime.combine(now.date(), close_time) - timedelta(minutes=SQUARE_OFF_BUFFER)).time()
+        
+        if current_time >= square_off_time or current_time >= close_time:
+            if self.positions:
+                logger.info(f"[SQUARE OFF] Market closing. Squaring off {len(self.positions)} positions...")
+                for position in self.positions[:]:
+                    symbol = position['symbol']
+                    qty = position['quantity']
+                    current_price = self.get_ltp(symbol)
+                    
+                    if not current_price:
+                        current_price = position['entry_price']
+                        logger.warning(f"[SQUARE OFF] Using entry price for {symbol}")
+                    
+                    self.place_order(symbol, "SELL", qty, current_price)
+                    logger.info(f"[SQUARE OFF] {symbol}: ₹{position['entry_price']:.2f} → ₹{current_price:.2f}")
+                
+                self.generate_daily_summary()
+                self.running = False
+                return True
+            
+            logger.info("[SQUARE OFF] No positions to close.")
+            self.running = False
+            return True
+        
+        return False
+
+    def check_daily_loss_limit(self):
+        daily_loss_pct = (self.initial_capital - self.capital) / self.initial_capital
+        if daily_loss_pct >= MAX_DAILY_LOSS:
+            logger.warning(f"[RISK] ⚠️ MAX DAILY LOSS REACHED: {daily_loss_pct*100:.2f}%")
+            self.scan_status = "⛔ Stopped - Max Daily Loss Reached"
+            self.running = False
+            return True
+        return False
+
+    # ============================================================
+    # ORDER FUNCTIONS
+    # ============================================================
+
+    def place_order(self, symbol, transaction_type, quantity=1, price=None):
+        try:
+            if price is None:
+                price = self.get_ltp(symbol)
+                if not price:
+                    logger.error(f"[FAIL] Could not get price for {symbol}")
+                    return None
+            
+            order_id = f"PAPER_{datetime.now().strftime('%H%M%S')}_{symbol}"
+            margin = (price * quantity) / LEVERAGE
+            
+            with self.lock:
+                if transaction_type == "BUY":
+                    self.available_capital -= margin
+                else:
+                    self.available_capital += margin
+                    
+            logger.info(f"📝 [PAPER ORDER] {transaction_type} | {symbol} | Qty: {quantity} @ Rs.{price:.2f} | Margin: Rs.{margin:.2f}")
+            return order_id
+        except Exception as e:
+            logger.error(f"[ORDER FAILURE] System exception: {e}")
+            return None
+
+    def is_trading_time(self):
+        now = datetime.now()
+        current_time = now.time()
+        trading_start_time = datetime.strptime(TRADING_START, "%H:%M").time()
+        market_close_time = datetime.strptime(MARKET_CLOSE, "%H:%M").time()
+        square_off_time = (datetime.combine(now.date(), market_close_time) - timedelta(minutes=SQUARE_OFF_BUFFER)).time()
+        
+        return trading_start_time <= current_time < square_off_time
+
+    # ============================================================
+    # MARKET DATA FUNCTIONS
+    # ============================================================
 
     def update_bulk_market_data(self):
         if not self.stock_list:
@@ -301,6 +892,28 @@ class AngelTradingBot:
             pass
         return None, "NEUTRAL", 0
 
+    def get_market_condition(self):
+        try:
+            nifty = yf.Ticker("^NSEI")
+            data = nifty.history(period="5d", interval="15m")
+            if not data.empty:
+                close = data['Close']
+                current = close.iloc[-1]
+                prev_close = close.iloc[-2] if len(close) > 1 else current
+                change = ((current - prev_close) / prev_close) * 100
+                
+                sma20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else current
+                
+                if current > sma20 * 1.005:
+                    return f"📈 UPTREND ({change:+.2f}%)"
+                elif current < sma20 * 0.995:
+                    return f"📉 DOWNTREND ({change:+.2f}%)"
+                else:
+                    return f"➡️ CONSOLIDATION ({change:+.2f}%)"
+        except:
+            pass
+        return "❓ UNKNOWN"
+
     def is_market_tradeable(self):
         try:
             nifty = yf.Ticker("^NSEI")
@@ -316,11 +929,11 @@ class AngelTradingBot:
 
     def score_stock(self, symbol):
         try:
-            if symbol not in self.bulk_data_store:
-                return 0, "NEUTRAL", "NONE"
-            data = self.bulk_data_store[symbol]
+            # Get data from dual source
+            data = self.get_indicator_data(symbol)
             if data is None or len(data) < 5:
                 return 0, "NEUTRAL", "NONE"
+            
             if ENABLE_MARKET_FILTER and not self.is_market_tradeable():
                 return 0, "NEUTRAL", "NONE"
 
@@ -329,6 +942,12 @@ class AngelTradingBot:
             vwap_series = self.calculate_vwap(data)
             vwap_val = vwap_series.iloc[-1] if vwap_series is not None and len(vwap_series) > 0 else current_price
             ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+            
+            avg_volume = data['Volume'].rolling(20).mean().iloc[-1]
+            current_volume = data['Volume'].iloc[-1]
+            
+            if current_volume < avg_volume * 0.5:
+                return 0, "NEUTRAL", "NONE"
             
             if current_price > vwap_val and current_price > ema20:
                 orb_p, orb_dir, orb_score = self.detect_orb(symbol, data)
@@ -339,48 +958,340 @@ class AngelTradingBot:
             pass
         return 0, "NEUTRAL", "NONE"
 
-    def get_prices_bulk(self, symbols):
-        all_stocks = []
-        limit_symbols = symbols[:120] 
-        try:
-            tickers = [f"{s}.NS" for s in limit_symbols]
-            data = yf.download(tickers=tickers, period="1d", progress=False)
-            for symbol in limit_symbols:
-                ticker_name = f"{symbol}.NS"
-                if len(limit_symbols) == 1:
-                    price = float(data['Close'].iloc[-1]) if not data.empty else None
-                else:
-                    price = float(data['Close'][ticker_name].iloc[-1]) if ticker_name in data['Close'].columns else None
-                
-                if price and MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
-                    token = self.symbol_tokens.get(symbol)
-                    if token:
-                        all_stocks.append({'symbol': symbol, 'token': token, 'price': price})
-        except Exception as e:
-            logger.error(f"Error filtering stock pricing boundaries: {e}")
-        return all_stocks
-
+    # ============================================================
+    # STOCK FETCHING WITH SMART SELECTION
+    # ============================================================
+    
     def fetch_all_stocks(self):
-        if AUTO_PICK_STOCKS and NSEPYTHON_AVAILABLE:
+        logger.info("="*60)
+        logger.info("📊 FETCHING STOCK LIST - SMART SELECTION SYSTEM")
+        logger.info("="*60)
+        
+        tier_methods = [
+            ("TIER 1: nsepython NIFTY 500", self._fetch_nsepython_nifty500),
+            ("TIER 2: nsepython NIFTY 50 + NEXT 50", self._fetch_nsepython_nifty50_next),
+            ("TIER 3: Official NSE EQUITY_L.csv", self._fetch_nse_equity_csv),
+            ("TIER 4: NSE Bhavcopy", self._fetch_bhavcopy),
+            ("TIER 5: NSE Website API", self._fetch_nse_website_api),
+            ("TIER 6: Hardcoded Fallback", self._fetch_hardcoded_fallback),
+        ]
+        
+        for tier_name, fetch_method in tier_methods:
             try:
-                logger.info("[AUTO] Extracting Nifty 500 pool dynamically...")
-                symbols = nsepython.nse_nifty500()
+                logger.info(f"[{tier_name}] Attempting...")
+                symbols = fetch_method()
                 if symbols and len(symbols) > 10:
+                    logger.info(f"✅ {tier_name} - Loaded {len(symbols)} stocks")
                     return self.get_prices_bulk(symbols)
             except Exception as e:
-                logger.warning(f"Nsepython failure ({e}). Falling back to layout array.")
-        return self.fetch_from_yahoo_fallback()
-
-    def fetch_from_yahoo_fallback(self):
-        fallback_symbols = [
-            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
-            "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
-            "LT", "AXISBANK", "WIPRO", "MARUTI", "TITAN",
-            "TECHM", "NTPC", "ULTRACEMCO", "M&M", "BAJFINANCE",
-            "SUNPHARMA", "POWERGRID", "NESTLEIND", "HCLTECH",
-            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE"
+                logger.warning(f"❌ {tier_name} failed: {e}")
+        
+        logger.error("❌ ALL TIERS FAILED! No stocks loaded.")
+        return []
+    
+    def _fetch_nsepython_nifty500(self):
+        if AUTO_PICK_STOCKS and NSEPYTHON_AVAILABLE:
+            if hasattr(nsepython, 'nse_nifty500'):
+                symbols = nsepython.nse_nifty500()
+                if symbols and len(symbols) > 10:
+                    return symbols
+        return []
+    
+    def _fetch_nsepython_nifty50_next(self):
+        if AUTO_PICK_STOCKS and NSEPYTHON_AVAILABLE:
+            nifty50 = []
+            next_nifty50 = []
+            
+            if hasattr(nsepython, 'nse_nifty50'):
+                nifty50 = nsepython.nse_nifty50()
+            
+            if hasattr(nsepython, 'nse_next_nifty50'):
+                next_nifty50 = nsepython.nse_next_nifty50()
+            
+            all_symbols = list(set(nifty50 + next_nifty50))
+            if all_symbols and len(all_symbols) > 10:
+                return all_symbols
+        return []
+    
+    def _fetch_nse_equity_csv(self):
+        url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+        
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            content = response.content.decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(content))
+            
+            symbols = []
+            for row in csv_reader:
+                symbol = row.get('SYMBOL', '').strip()
+                series = row.get('SERIES', '').strip()
+                
+                if symbol and series in ['EQ', 'BE']:
+                    symbol = symbol.replace('&', '').replace('-', '').replace(' ', '')
+                    symbols.append(symbol)
+            
+            return symbols
+        return []
+    
+    def _fetch_bhavcopy(self):
+        from datetime import datetime, timedelta
+        
+        for days_back in range(5):
+            date = datetime.now() - timedelta(days=days_back)
+            date_str = date.strftime("%d%m%Y")
+            url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
+            
+            try:
+                response = requests.get(url, timeout=30)
+                if response.status_code == 200:
+                    content = response.content.decode('utf-8')
+                    csv_reader = csv.DictReader(io.StringIO(content))
+                    
+                    symbols = []
+                    for row in csv_reader:
+                        symbol = row.get('SYMBOL', '').strip()
+                        if symbol:
+                            symbols.append(symbol)
+                    
+                    if symbols:
+                        return symbols
+            except:
+                continue
+        return []
+    
+    def _fetch_nse_website_api(self):
+        try:
+            url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                symbols = [item['symbol'] for item in data.get('data', [])]
+                return symbols
+        except:
+            pass
+        return []
+    
+    def _fetch_hardcoded_fallback(self):
+        nifty50 = [
+            "ADANIPORTS", "ASIANPAINT", "AXISBANK", "BAJFINANCE", "BAJAJFINSV",
+            "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB",
+            "DRREDDY", "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK",
+            "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK",
+            "INDUSINDBK", "INFY", "ITC", "JSWSTEEL", "KOTAKBANK",
+            "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC",
+            "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
+            "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TCS",
+            "TECHM", "TITAN", "ULTRACEMCO", "UPL", "WIPRO"
         ]
-        return self.get_prices_bulk(fallback_symbols)
+        
+        next_nifty50 = [
+            "ABB", "ADANIENT", "AMBUJACEM", "BANDHANBNK", "BANKBARODA",
+            "BERGEPAINT", "BIOCON", "CANBK", "COLPAL", "DABUR",
+            "DIXON", "FEDERALBNK", "HAVELLS", "HDFCAMC", "ICICIGI",
+            "ICICIPRULI", "IDFCFIRSTB", "INDIGO", "IOC", "MARICO",
+            "MUTHOOTFIN", "NAUKRI", "PAGEIND", "PEL", "PIDILITIND",
+            "PNB", "RBLBANK", "SBICARD", "SHREECEM", "SIEMENS",
+            "SRTRANSFIN", "TATAPOWER", "TORNTPHARM", "TRENT", "VEDL",
+            "ZYDUSLIFE", "MANKIND", "LUPIN", "AUROPHARMA", "MPHASIS",
+            "BAJAJHLDNG", "THERMAX", "PFC", "RECLTD", "IRFC",
+            "HAL", "BEL", "GAIL", "BPCL", "ONGC"
+        ]
+        
+        return list(set(nifty50 + next_nifty50))
+    
+    def get_prices_bulk(self, symbols):
+        all_stocks = []
+        limit_symbols = symbols[:500]
+        
+        logger.info(f"📊 Analyzing {len(limit_symbols)} stocks with volume surge detection...")
+        
+        stock_data = []
+        
+        try:
+            tickers = [f"{s}.NS" for s in limit_symbols]
+            data = yf.download(tickers=tickers, period="5d", interval="15m", progress=False)
+            
+            if data.empty:
+                logger.warning("No data returned from Yahoo Finance")
+                return []
+            
+            for symbol in limit_symbols:
+                try:
+                    ticker_name = f"{symbol}.NS"
+                    
+                    if len(limit_symbols) == 1:
+                        price = float(data['Close'].iloc[-1]) if not data.empty else None
+                        volume = float(data['Volume'].iloc[-1]) if not data.empty else 0
+                    else:
+                        if ticker_name in data['Close'].columns:
+                            price = float(data['Close'][ticker_name].iloc[-1])
+                            volume = float(data['Volume'][ticker_name].iloc[-1])
+                        else:
+                            continue
+                    
+                    if not (MIN_STOCK_PRICE < price < MAX_STOCK_PRICE):
+                        continue
+                    
+                    token = self.symbol_tokens.get(symbol)
+                    if not token:
+                        continue
+                    
+                    try:
+                        volume_series = data[ticker_name]['Volume'] if ticker_name in data.columns.levels[0] else pd.Series()
+                        if len(volume_series) > 5:
+                            avg_volume = volume_series.tail(5).mean()
+                            current_volume = volume_series.iloc[-1]
+                            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+                        else:
+                            avg_volume = volume
+                            volume_ratio = 1
+                    except:
+                        avg_volume = volume
+                        volume_ratio = 1
+                    
+                    try:
+                        close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
+                        if len(close_prices) > 1:
+                            returns = close_prices.pct_change().dropna()
+                            volatility = returns.std() * 100
+                        else:
+                            volatility = 0
+                    except:
+                        volatility = 0
+                    
+                    if price > 500 and volume > 500000:
+                        tier = "Large"
+                        base_score = 70
+                    elif price > 100 and volume > 200000:
+                        tier = "Mid"
+                        base_score = 85
+                    elif price > 50 and volume > 100000:
+                        tier = "Small"
+                        base_score = 100
+                    else:
+                        continue
+                    
+                    score = base_score
+                    
+                    if volume_ratio >= 5.0:
+                        score += 30
+                        surge_level = "🚀🚀🚀 5x+ (EXCEPTIONAL!)"
+                    elif volume_ratio >= 4.0:
+                        score += 25
+                        surge_level = "🚀🚀 4x (VERY STRONG)"
+                    elif volume_ratio >= 3.0:
+                        score += 18
+                        surge_level = "🚀 3x (STRONG)"
+                    elif volume_ratio >= 2.0:
+                        score += 10
+                        surge_level = "📈 2x (MODERATE)"
+                    else:
+                        surge_level = "➖ Normal"
+                    
+                    if 2 <= volatility <= 5:
+                        score += 15
+                    
+                    try:
+                        close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
+                        if len(close_prices) > 20:
+                            sma20 = close_prices.tail(20).mean()
+                            if price > sma20:
+                                score += 10
+                    except:
+                        pass
+                    
+                    score = min(score, 100)
+                    
+                    stock_data.append({
+                        'symbol': symbol,
+                        'token': token,
+                        'price': price,
+                        'volume': volume,
+                        'avg_volume': avg_volume,
+                        'volume_ratio': volume_ratio,
+                        'surge_level': surge_level,
+                        'volatility': volatility,
+                        'tier': tier,
+                        'score': score
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+            stock_data.sort(key=lambda x: x['score'], reverse=True)
+            selected = stock_data[:MAX_STOCKS_TO_SCAN]
+            
+            tier_counts = {"Large": 0, "Mid": 0, "Small": 0}
+            final_selected = []
+            
+            for stock in selected:
+                if tier_counts[stock['tier']] < MAX_STOCKS_TO_SCAN // 5:
+                    final_selected.append(stock)
+                    tier_counts[stock['tier']] += 1
+            
+            remaining_slots = MAX_STOCKS_TO_SCAN - len(final_selected)
+            for stock in selected:
+                if stock not in final_selected and remaining_slots > 0:
+                    final_selected.append(stock)
+                    remaining_slots -= 1
+            
+            for stock in final_selected:
+                all_stocks.append({
+                    'symbol': stock['symbol'],
+                    'token': stock['token'],
+                    'price': stock['price']
+                })
+            
+            logger.info(f"✅ Selected {len(final_selected)} stocks with diversity:")
+            logger.info(f"   🏛️ Large Cap: {tier_counts['Large']} stocks")
+            logger.info(f"   📊 Mid Cap:   {tier_counts['Mid']} stocks")
+            logger.info(f"   🚀 Small Cap: {tier_counts['Small']} stocks")
+            
+            logger.info("📊 Top 10 selected stocks with surge detection:")
+            for i, stock in enumerate(final_selected[:10], 1):
+                tier_emoji = "🏛️" if stock['tier'] == "Large" else "📊" if stock['tier'] == "Mid" else "🚀"
+                logger.info(f"   {i:2}. {tier_emoji} {stock['symbol']:<12} {stock['tier']:<6} ₹{stock['price']:<8.2f} {stock['surge_level']:<12} Score: {stock['score']}")
+            
+        except Exception as e:
+            logger.error(f"Error in get_prices_bulk: {e}")
+            return self.get_prices_fallback(symbols)
+        
+        logger.info(f"✅ Filtered to {len(all_stocks)} stocks (price: ₹{MIN_STOCK_PRICE}-₹{MAX_STOCK_PRICE})")
+        
+        return all_stocks
+
+    def get_prices_fallback(self, symbols):
+        all_stocks = []
+        limit_symbols = symbols[:MAX_STOCKS_TO_SCAN]
+        
+        logger.info(f"📊 Using fallback: Processing {len(limit_symbols)} stocks...")
+        
+        for symbol in limit_symbols:
+            try:
+                token = self.symbol_tokens.get(symbol)
+                if not token:
+                    continue
+                
+                stock = yf.Ticker(f"{symbol}.NS")
+                data = stock.history(period="1d")
+                if not data.empty:
+                    price = float(data['Close'].iloc[-1])
+                    if MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
+                        all_stocks.append({
+                            'symbol': symbol,
+                            'token': token,
+                            'price': price
+                        })
+            except Exception as e:
+                continue
+        
+        return all_stocks
 
     def calculate_estimated_charges(self, entry_price, exit_price, quantity):
         turnover = (entry_price + exit_price) * quantity
@@ -394,28 +1305,9 @@ class AngelTradingBot:
         stamp_duty = (entry_price * quantity) * 0.00003
         return total_brokerage + stt + txn_charges + gst + sebi_fee + stamp_duty
 
-    def place_order(self, symbol, transaction_type, quantity=1, price=None):
-        try:
-            if price is None:
-                price = self.get_ltp(symbol)
-                if not price:
-                    logger.error(f"[FAIL] Could not get price token execution context for {symbol}")
-                    return None
-            
-            order_id = f"PAPER_{datetime.now().strftime('%H%M%S')}_{symbol}"
-            margin = (price * quantity) / LEVERAGE
-            
-            with self.lock:
-                if transaction_type == "BUY":
-                    self.available_capital -= margin
-                else:
-                    self.available_capital += margin
-                    
-            logger.info(f"📝 [PAPER ORDER] {transaction_type} | {symbol} | Qty: {quantity} @ Rs.{price:.2f} | Margin: Rs.{margin:.2f}")
-            return order_id
-        except Exception as e:
-            logger.error(f"[ORDER FAILURE] System exception occurred inside place_order processing layout: {e}")
-            return None
+    # ============================================================
+    # ENHANCED CHECK EXITS WITH PARTIAL PROFIT TAKING
+    # ============================================================
 
     def check_exits(self):
         try:
@@ -429,51 +1321,184 @@ class AngelTradingBot:
                 qty = position['quantity']
                 pnl_pct = (current_price - entry_price) / entry_price
                 raw_pnl = (current_price - entry_price) * qty
+                profit_target = position.get('profit_target', DEFAULT_PROFIT_TARGET)
                 
                 if current_price > position['peak_price']:
                     position['peak_price'] = current_price
                 
                 trailing_sl_price = position['peak_price'] * (1.0 - TRAILING_SL_PULLBACK)
+                trailing_activated = (position['peak_price'] - entry_price) / entry_price >= TRAILING_SL_ACTIVATION
+                
                 exit_triggered = False
                 exit_reason = ""
+                exit_type = "FULL"
+                exit_qty = qty
                 
-                if pnl_pct >= position.get('profit_target', DEFAULT_PROFIT_TARGET):
+                if pnl_pct >= profit_target:
                     exit_triggered = True
-                    exit_reason = f"🎯 [PROFIT TARGET] Exited {symbol} at +{pnl_pct*100:.2f}%"
-                elif (position['peak_price'] - entry_price) / entry_price >= TRAILING_SL_ACTIVATION and current_price <= trailing_sl_price:
+                    exit_reason = f"🎯 [MAIN TARGET] Exited {symbol} at +{pnl_pct*100:.2f}%"
+                    exit_type = "FULL"
+                    exit_qty = qty
+                
+                elif ENABLE_PARTIAL_EXIT and not position.get('partial_exit_done', False):
+                    if pnl_pct >= PARTIAL_EXIT_LEVEL_1 and pnl_pct < profit_target:
+                        exit_triggered = True
+                        exit_qty = int(qty * 0.33)
+                        exit_reason = f"📊 [PARTIAL EXIT 1] Exited 33% of {symbol} at +{pnl_pct*100:.2f}%"
+                        exit_type = "PARTIAL"
+                        position['partial_exit_done'] = True
+                        position['partial_exit_1_done'] = True
+                    
+                    elif pnl_pct >= PARTIAL_EXIT_LEVEL_2 and position.get('partial_exit_1_done', False) and not position.get('partial_exit_2_done', False):
+                        exit_triggered = True
+                        exit_qty = int(qty * 0.33)
+                        exit_reason = f"📊 [PARTIAL EXIT 2] Exited 33% of {symbol} at +{pnl_pct*100:.2f}%"
+                        exit_type = "PARTIAL"
+                        position['partial_exit_2_done'] = True
+                    
+                    elif pnl_pct >= PARTIAL_EXIT_LEVEL_3 and position.get('partial_exit_2_done', False) and not position.get('partial_exit_3_done', False):
+                        exit_triggered = True
+                        exit_qty = position['remaining_qty'] if 'remaining_qty' in position else qty
+                        exit_reason = f"📊 [PARTIAL EXIT 3] Exited remaining of {symbol} at +{pnl_pct*100:.2f}%"
+                        exit_type = "PARTIAL"
+                        position['partial_exit_3_done'] = True
+                
+                elif trailing_activated and current_price <= trailing_sl_price:
                     exit_triggered = True
-                    exit_reason = f"🛡️ [TRAILING SL] Exited {symbol} at +{pnl_pct*100:.2f}%"
+                    peak_profit = ((position['peak_price'] - entry_price) / entry_price) * 100
+                    exit_reason = f"🛡️ [TRAILING SL] Exited {symbol} at +{pnl_pct*100:.2f}% (Peak: +{peak_profit:.2f}%)"
+                    exit_type = "FULL"
+                    exit_qty = qty
+                
                 elif pnl_pct <= -STOP_LOSS:
                     exit_triggered = True
                     exit_reason = f"🛑 [STOP LOSS] Exited {symbol} at {pnl_pct*100:.2f}%"
+                    exit_type = "FULL"
+                    exit_qty = qty
+                
                 elif ((datetime.now() - position['entry_time']).total_seconds() / 60) > MAX_HOLD_MINUTES:
                     exit_triggered = True
                     exit_reason = f"⏳ [TIME EXPIRED] Exited {symbol} at {pnl_pct*100:.2f}%"
+                    exit_type = "FULL"
+                    exit_qty = qty
                 
                 if exit_triggered:
-                    self.place_order(symbol, "SELL", qty, current_price)
-                    charges = self.calculate_estimated_charges(entry_price, current_price, qty)
-                    net_pnl = raw_pnl - charges
-                    
-                    with self.lock:
-                        self.capital += net_pnl
-                        self.trades.append({
-                            'symbol': symbol, 'gross_pnl': raw_pnl, 'charges': charges,
-                            'net_pnl': net_pnl, 'pnl_pct': pnl_pct, 'strategy': position['strategy'],
-                            'exit_status': "Target Hit" if pnl_pct > 0 else "Stop Loss", 'direction': 'BUY/SELL',
-                            'entry_price': entry_price, 'exit_price': current_price
-                        })
-                        self.positions.remove(position)
-                    logger.info(f"{exit_reason} | Fees: ₹{charges:.2f} | Net Yield: ₹{net_pnl:.2f}")
+                    if exit_type == "PARTIAL":
+                        self.place_order(symbol, "SELL", exit_qty, current_price)
+                        
+                        position['quantity'] -= exit_qty
+                        position['remaining_qty'] = position['quantity']
+                        position['entry_price'] = current_price
+                        
+                        charges = self.calculate_estimated_charges(entry_price, current_price, exit_qty)
+                        net_pnl = raw_pnl - charges
+                        
+                        with self.lock:
+                            self.capital += net_pnl
+                            self.daily_pnl += net_pnl
+                            self.total_trades_today += 1
+                            self.trades.append({
+                                'symbol': symbol,
+                                'gross_pnl': raw_pnl,
+                                'charges': charges,
+                                'net_pnl': net_pnl,
+                                'pnl_pct': pnl_pct,
+                                'strategy': position['strategy'],
+                                'exit_status': "Partial Exit",
+                                'direction': 'BUY/SELL',
+                                'entry_price': entry_price,
+                                'exit_price': current_price,
+                                'exit_time': datetime.now().isoformat(),
+                                'exit_type': 'PARTIAL'
+                            })
+                            
+                            self.save_trade({
+                                'symbol': symbol,
+                                'entry_price': entry_price,
+                                'exit_price': current_price,
+                                'quantity': exit_qty,
+                                'gross_pnl': raw_pnl,
+                                'net_pnl': net_pnl,
+                                'strategy': position.get('strategy', ''),
+                                'exit_reason': exit_reason,
+                                'entry_time': position.get('entry_time', datetime.now()).isoformat(),
+                                'exit_time': datetime.now().isoformat(),
+                                'exit_type': 'PARTIAL'
+                            })
+                        
+                        logger.info(f"{exit_reason} | Qty: {exit_qty} | Fees: ₹{charges:.2f} | Net Yield: ₹{net_pnl:.2f}")
+                        logger.info(f"📊 Remaining {position['quantity']} shares of {symbol} still open")
+                        
+                        position['peak_price'] = current_price
+                        
+                    else:
+                        self.place_order(symbol, "SELL", exit_qty, current_price)
+                        charges = self.calculate_estimated_charges(entry_price, current_price, exit_qty)
+                        net_pnl = raw_pnl - charges
+                        
+                        with self.lock:
+                            self.capital += net_pnl
+                            self.daily_pnl += net_pnl
+                            self.total_trades_today += 1
+                            self.trades.append({
+                                'symbol': symbol,
+                                'gross_pnl': raw_pnl,
+                                'charges': charges,
+                                'net_pnl': net_pnl,
+                                'pnl_pct': pnl_pct,
+                                'strategy': position['strategy'],
+                                'exit_status': "Target Hit" if pnl_pct > 0 else "Stop Loss",
+                                'direction': 'BUY/SELL',
+                                'entry_price': entry_price,
+                                'exit_price': current_price,
+                                'exit_time': datetime.now().isoformat(),
+                                'exit_type': 'FULL'
+                            })
+                            
+                            self.save_trade({
+                                'symbol': symbol,
+                                'entry_price': entry_price,
+                                'exit_price': current_price,
+                                'quantity': exit_qty,
+                                'gross_pnl': raw_pnl,
+                                'net_pnl': net_pnl,
+                                'strategy': position.get('strategy', ''),
+                                'exit_reason': exit_reason,
+                                'entry_time': position.get('entry_time', datetime.now()).isoformat(),
+                                'exit_time': datetime.now().isoformat(),
+                                'exit_type': 'FULL'
+                            })
+                            
+                            self.positions.remove(position)
+                        
+                        logger.info(f"{exit_reason} | Fees: ₹{charges:.2f} | Net Yield: ₹{net_pnl:.2f}")
+                        
         except Exception as e:
             logger.error(f"[EXIT ENGINE ERROR] Exception tracking runtime matrix state: {e}")
 
+    # ============================================================
+    # SCAN AND TRADE WITH DYNAMIC POSITION SIZING
+    # ============================================================
+
     def scan_and_trade(self):
+        if not self.is_trading_time():
+            self.scan_status = "⏰ Outside trading hours"
+            logger.info("[SCAN] Outside trading hours. Waiting for market open.")
+            return
+        
         if len(self.positions) >= MAX_POSITIONS:
+            self.scan_status = f"⏸️ Max positions ({MAX_POSITIONS}) reached"
             logger.info(f"[SCAN] Max position cap hit ({len(self.positions)}/{MAX_POSITIONS}). Skipping setups.")
             return
+        
+        self.scan_count += 1
+        self.last_scan_time = datetime.now()
+        self.scan_status = "🔄 Scanning stocks..."
+        self.market_condition = self.get_market_condition()
             
-        logger.info("[SCAN] Sweeping downloaded metrics to evaluate trade setups...")
+        logger.info(f"[SCAN] 🔍 Sweeping downloaded metrics to evaluate trade setups... (Scan #{self.scan_count})")
+        logger.info(f"[SCAN] 📊 Market Condition: {self.market_condition}")
+        
         def evaluate_signal(symbol):
             if any(pos['symbol'] == symbol for pos in self.positions):
                 return None
@@ -481,12 +1506,41 @@ class AngelTradingBot:
             return (symbol, score, direction, strategy)
 
         signals = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        scored_count = 0
+        
+        with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(evaluate_signal, s) for s in self.stock_list]
             for fut in as_completed(futures):
                 res = fut.result()
+                scored_count += 1
                 if res and res[1] >= MIN_SIGNAL_SCORE and res[2] == "LONG":
                     signals.append(res)
+                    logger.info(f"[SCAN] 📈 Found signal: {res[0]} | Score: {res[1]} | Strategy: {res[2]}")
+        
+        self.stocks_scored = scored_count
+        self.signals_found = len(signals)
+        
+        logger.info(f"[SCAN] 📊 Completed: {scored_count} stocks scored, {len(signals)} signals found")
+        
+        if not signals:
+            self.scan_status = f"❌ No signals found (Scored: {scored_count})"
+            logger.info("[SCAN] ❌ No signals found above minimum score threshold")
+            return
+        
+        signals.sort(key=lambda x: x[1], reverse=True)
+        logger.info(f"[SCAN] 📊 Sorted signals by score (highest first)")
+        
+        def get_position_allocation(score):
+            if score >= 10:
+                return 0.45
+            elif score >= 9:
+                return 0.35
+            elif score >= 8:
+                return 0.25
+            elif score >= 7:
+                return 0.15
+            else:
+                return 0.00
                     
         for symbol, score, direction, strategy in signals:
             if len(self.positions) >= MAX_POSITIONS:
@@ -494,68 +1548,171 @@ class AngelTradingBot:
                 
             current_price = self.get_ltp(symbol)
             if not current_price:
+                logger.warning(f"[SCAN] ⚠️ Could not get live price for {symbol}")
                 continue
-                
-            qty = int((self.capital / MAX_POSITIONS) / current_price)
-            if qty <= 0:
-                continue
-                
-            margin = (current_price * qty) / LEVERAGE
             
+            if not self.check_correlation(symbol):
+                logger.info(f"[FILTER] {symbol} skipped due to correlation filter")
+                continue
+            
+            if not self.check_sector_exposure(symbol):
+                logger.info(f"[FILTER] {symbol} skipped due to sector exposure")
+                continue
+            
+            dynamic_sl = self.get_dynamic_stop_loss(symbol, current_price)
+            volatility_sl = self.get_volatility_stop(symbol, current_price)
+            final_sl = max(dynamic_sl, volatility_sl)
+            
+            allocation_pct = get_position_allocation(score)
+            allocation_amount = self.capital * allocation_pct
+            
+            qty = int(allocation_amount / current_price)
+            
+            if qty <= 0:
+                logger.warning(f"[SCAN] ⚠️ Quantity 0 for {symbol}")
+                continue
+                
+            margin = (current_price * qty) / LEVERAGE            
             with self.lock:
                 if margin > self.available_capital:
-                    logger.warning(f"[MARGIN INSURGENCY] Skipped {symbol}: Need ₹{margin:.2f}, Have ₹{self.available_capital:.2f}")
+                    logger.warning(f"[MARGIN INSUFFICIENCY] ❌ Skipped {symbol}: Need ₹{margin:.2f}, Have ₹{self.available_capital:.2f}")
                     continue
                     
-                logger.info(f"💥 [SIGNAL DETECTED] {symbol} -> Score: {score} Qty: {qty} @ ₹{current_price}")
+                logger.info(f"💥 [SIGNAL DETECTED] {symbol} -> Score: {score} | Qty: {qty} | Price: ₹{current_price:.2f}")
+                logger.info(f"[ALLOCATION] {allocation_pct*100:.1f}% of capital (₹{allocation_amount:.2f})")
+                logger.info(f"[RISK] SL: {final_sl*100:.2f}% | Margin: ₹{margin:.2f}")
                 
-                order_id = f"PAPER_{datetime.now().strftime('%H%M%S')}_{symbol}"
-                self.available_capital -= margin
+                profit_target = PROFIT_TARGETS.get(score, DEFAULT_PROFIT_TARGET)
+                target_price = current_price * (1 + profit_target)
+                stop_price = current_price * (1 - final_sl)
                 
-                logger.info(f"📝 [PAPER ORDER] BUY | {symbol} | Qty: {qty} @ Rs.{current_price:.2f} | Margin: Rs.{margin:.2f}")
+                self.place_order(symbol, "BUY", qty, current_price)
                 
                 self.positions.append({
-                    'symbol': symbol, 'entry_price': current_price, 'peak_price': current_price,  
-                    'quantity': qty, 'entry_time': datetime.now(), 'score': score,
-                    'profit_target': PROFIT_TARGETS.get(score, DEFAULT_PROFIT_TARGET), 'strategy': strategy
+                    'symbol': symbol, 
+                    'entry_price': current_price, 
+                    'peak_price': current_price,  
+                    'quantity': qty,
+                    'remaining_qty': qty,
+                    'entry_time': datetime.now(), 
+                    'score': score,
+                    'profit_target': profit_target, 
+                    'strategy': strategy,
+                    'stop_loss': final_sl,
+                    'target_price': target_price,
+                    'stop_price': stop_price,
+                    'partial_exit_done': False,
+                    'partial_exit_1_done': False,
+                    'partial_exit_2_done': False,
+                    'partial_exit_3_done': False
                 })
+                
+                self.scan_status = f"✅ Position opened: {symbol} (Score: {score}, Allocation: {allocation_pct*100:.1f}%)"
+
+    # ============================================================
+    # GENERATE DAILY SUMMARY
+    # ============================================================
+
+    def generate_daily_summary(self):
+        logger.info("\n" + "="*70)
+        logger.info("📊 DAILY TRADING SUMMARY - " + datetime.now().strftime('%A, %B %d, %Y'))
+        logger.info("="*70)
+        
+        logger.info("\n💰 CAPITAL STATUS:")
+        logger.info(f"   Starting Capital: ₹{self.initial_capital:,.2f}")
+        logger.info(f"   Current Capital:  ₹{self.capital:,.2f}")
+        logger.info(f"   Today's P&L:      ₹{self.daily_pnl:,.2f} ({self.daily_pnl/self.initial_capital*100:+.2f}%)")
+        
+        logger.info("\n📈 TRADING ACTIVITY:")
+        logger.info(f"   Total Trades Today: {len(self.trades)}")
+        logger.info(f"   Active Positions:   {len(self.positions)}")
+        logger.info(f"   Stocks Scanned:     {len(self.stock_list)}")
+        logger.info(f"   Total Scans:        {self.scan_count}")
+        logger.info(f"   Market Condition:   {self.market_condition}")
+        
+        partial_exits = len([t for t in self.trades if t.get('exit_type') == 'PARTIAL'])
+        full_exits = len([t for t in self.trades if t.get('exit_type') == 'FULL'])
+        
+        logger.info("\n📊 EXIT STATISTICS:")
+        logger.info(f"   Partial Exits:      {partial_exits}")
+        logger.info(f"   Full Exits:         {full_exits}")
+        
+        logger.info("\n📊 POSITION SIZING:")
+        for pos in self.positions:
+            score = pos.get('score', 0)
+            logger.info(f"      • {pos['symbol']} | Score: {score} | Qty: {pos['quantity']}")
+        
+        logger.info("\n🛡️ RISK MANAGEMENT METRICS:")
+        logger.info(f"   Dynamic SL:         {'Enabled' if ENABLE_DYNAMIC_SL else 'Disabled'}")
+        logger.info(f"   ATR Sizing:         {'Enabled' if ENABLE_ATR_POSITION_SIZING else 'Disabled'}")
+        logger.info(f"   Correlation Filter: {'Enabled' if ENABLE_CORRELATION_FILTER else 'Disabled'}")
+        logger.info(f"   Sector Divers.:     {'Enabled' if ENABLE_SECTOR_DIVERSIFICATION else 'Disabled'}")
+        logger.info(f"   Volatility SL:      {'Enabled' if ENABLE_VOLATILITY_STOP else 'Disabled'}")
+        logger.info(f"   Trailing SL:        {'Enabled' if TRAILING_SL_ACTIVATION else 'Disabled'}")
+        logger.info(f"   Partial Exits:      {'Enabled' if ENABLE_PARTIAL_EXIT else 'Disabled'}")
+        logger.info(f"   Data Source:        {'Angel One API (Primary) + Yahoo (Fallback)'}")
+        
+        if self.positions:
+            logger.info("\n📊 CURRENT POSITIONS:")
+            for pos in self.positions:
+                live_p = self.get_ltp(pos['symbol']) or pos['entry_price']
+                pnl = (live_p - pos['entry_price']) * pos['quantity']
+                sl_used = pos.get('stop_loss', STOP_LOSS) * 100
+                remaining = pos.get('remaining_qty', pos['quantity'])
+                score = pos.get('score', 0)
+                logger.info(f"      • {pos['symbol']} | Score: {score} | Qty: {pos['quantity']} | Entry: ₹{pos['entry_price']:.2f} | SL: {sl_used:.2f}% | P&L: ₹{pnl:,.2f}")
+        
+        logger.info("\n" + "="*70)
+        logger.info(f"🏁 Bot Status: {'STOPPED' if not self.running else 'RUNNING'}")
+        logger.info(f"⏰ Report Generated: {datetime.now().strftime('%I:%M:%S %p')}")
+        logger.info("="*70 + "\n")
+
+    # ============================================================
+    # GITHUB SYNC & DASHBOARD
+    # ============================================================
 
     def sync_to_github_pages(self, html_content):
-        """Pushes compiled dashboard source cleanly to your GitHub Pages repository."""
         if not GITHUB_PAT or "ghp_" not in GITHUB_PAT:
+            logger.error("GitHub PAT missing or invalid.")
             return
         
         url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/index.html"
         headers = {
             "Authorization": f"token {GITHUB_PAT}",
-            "Accept": "application/vnd.github.v3+json"
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json"
         }
         
-        import base64
         encoded_content = base64.b64encode(html_content.encode('utf-8')).decode('utf-8')
         
-        try:
-            # Query if dashboard code already exists to grab file blob sha key match
-            r = requests.get(url, headers=headers)
-            sha = r.json().get("sha") if r.status_code == 200 else None
-            
-            payload = {
-                "message": f"Engine Sync Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                "content": encoded_content
-            }
-            if sha:
-                payload["sha"] = sha
+        for attempt in range(3): 
+            try:
+                r = requests.get(url, headers=headers)
+                sha = r.json().get("sha") if r.status_code == 200 else None
                 
-            push_res = requests.put(url, headers=headers, json=payload)
-            if push_res.status_code in [200, 201]:
-                logger.info("🚀 [GITHUB PUSH] Live dashboard updated successfully on GitHub Pages.")
-            else:
-                logger.warning(f"[GITHUB PUSH FAILED] Response code: {push_res.status_code} - {push_res.text}")
-        except Exception as e:
-            logger.error(f"[GITHUB SYNC EXCEPTION] Internal connectivity error: {e}")
+                payload = {
+                    "message": f"Engine Sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    "content": encoded_content
+                }
+                if sha:
+                    payload["sha"] = sha
+                    
+                push_res = requests.put(url, headers=headers, json=payload)
+                
+                if push_res.status_code in [200, 201]:
+                    logger.info("🚀 [GITHUB PUSH] Dashboard updated successfully.")
+                    return 
+                elif push_res.status_code == 409:
+                    logger.warning(f"[GITHUB PUSH] 409 Conflict detected. Retry {attempt+1}/3")
+                    time.sleep(2)
+                else:
+                    logger.error(f"[GITHUB PUSH FAILED] Code: {push_res.status_code} - {push_res.text}")
+                    break
+            except Exception as e:
+                logger.error(f"[GITHUB SYNC EXCEPTION] {e}")
+                break
 
     def render_and_deploy_dashboard(self):
-        """Compiles the entire runtime status into a beautifully structured single-page HTML PWA dashboard."""
         try:
             total_floating_pnl = 0.0
             formatted_positions = []
@@ -567,217 +1724,800 @@ class AngelTradingBot:
                 pos_pnl_pct = ((live_p - pos['entry_price']) / pos['entry_price']) * 100
                 total_floating_pnl += pos_pnl
                 
-                target_price = pos['entry_price'] * (1.0 + pos['profit_target'])
-                sl_price = pos['entry_price'] * (1.0 - STOP_LOSS)
-                
                 formatted_positions.append({
-                    "symbol": sym, "strategy": pos['strategy'], "quantity": pos['quantity'],
-                    "entry_price": round(pos['entry_price'], 2), "live_price": round(live_p, 2),
-                    "pnl": round(pos_pnl, 2), "pnl_pct": round(pos_pnl_pct, 2),
-                    "sl_price": round(sl_price, 2), "target_price": round(target_price, 2)
+                    "symbol": sym, 
+                    "strategy": pos['strategy'], 
+                    "quantity": pos['quantity'],
+                    "remaining": pos.get('remaining_qty', pos['quantity']),
+                    "score": pos.get('score', 0),
+                    "entry_price": round(pos['entry_price'], 2), 
+                    "live_price": round(live_p, 2),
+                    "pnl": round(pos_pnl, 2), 
+                    "pnl_pct": round(pos_pnl_pct, 2),
+                    "target": round(pos.get('target_price', pos['entry_price'] * 1.035), 2),
+                    "sl": round(pos.get('stop_price', pos['entry_price'] * 0.98), 2)
                 })
 
-            total_portfolio_value = self.available_capital + (self.capital - self.available_capital) + total_floating_pnl
-            floating_pct = (total_floating_pnl / self.initial_capital) * 100
+            total_portfolio_value = self.capital + total_floating_pnl
+            floating_pct = (total_floating_pnl / self.initial_capital * 100) if self.initial_capital > 0 else 0
             pnl_color_class = "text-emerald-400" if total_floating_pnl >= 0 else "text-rose-500"
             pnl_prefix = "+" if total_floating_pnl >= 0 else ""
 
-            ohlc_js_store = {}
-            for pos in self.positions:
-                sym = pos['symbol']
-                if sym in self.bulk_data_store:
-                    df = self.bulk_data_store[sym]
-                    if df is not None and not df.empty:
-                        candles = []
-                        vwap_series = self.calculate_vwap(df)
-                        for idx, row in df.iterrows():
-                            candles.append({
-                                "time": int(idx.timestamp()), "open": float(row['Open']), "high": float(row['High']),
-                                "low": float(row['Low']), "close": float(row['Close']),
-                                "vwap": float(vwap_series.loc[idx]) if vwap_series is not None else float(row['Close'])
-                            })
-                        ohlc_js_store[sym] = candles
-
-            if not ohlc_js_store and self.stock_list:
-                for sym in self.stock_list[:2]:
-                    if sym in self.bulk_data_store:
-                        df = self.bulk_data_store[sym]
-                        if df is not None and not df.empty:
-                            candles = []
-                            for idx, row in df.iterrows():
-                                candles.append({
-                                    "time": int(idx.timestamp()), "open": float(row['Open']), "high": float(row['High']),
-                                    "low": float(row['Low']), "close": float(row['Close']), "vwap": float(row['Close'])
-                                })
-                            ohlc_js_store[sym] = candles
-
-            # Clean replacement rendering to completely dodge python template interpreter bugs
+            positions_json = json.dumps(formatted_positions)
+            trades_json = json.dumps(self.trades[-20:])
+            
+            status_message = self.scan_status
+            
+            current_time = datetime.now().time()
+            market_close_time = datetime.strptime(MARKET_CLOSE, "%H:%M").time()
+            market_open_time = datetime.strptime(TRADING_START, "%H:%M").time()
+            
+            if not self.running:
+                status_message = "⏹️ Bot Stopped"
+            elif current_time >= market_close_time:
+                status_message = "⏰ Market Closed for Today"
+            elif current_time < market_open_time:
+                status_message = f"⏰ Market Opens at {TRADING_START}"
+            elif len(self.positions) == 0 and self.scan_count == 0:
+                status_message = "🔄 Waiting for signals..."
+            
             html_template = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Matrix Engine Live Tracker</title>
-    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <title>ALPHA - Trading Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #0b0e11; color: #e9ecef; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-        .card { background-color: #161a1e; border: 1px solid #2b3139; }
-        .pulse { animation: pulse-animation 2s infinite; }
-        @keyframes pulse-animation { 0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; } }
+        * { -webkit-tap-highlight-color: transparent; }
+        .pulse { animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+        .card { background: rgba(31, 41, 55, 0.5); backdrop-filter: blur(10px); border: 1px solid rgba(75, 85, 99, 0.3); }
+        body { background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%); min-height: 100vh; padding-bottom: 70px; }
+        .glow { text-shadow: 0 0 20px rgba(52, 211, 153, 0.3); }
+        .alpha-logo { font-size: 22px; font-weight: bold; color: #34d399; margin-right: 2px; }
+        .tagline { font-size: 8px; color: rgba(255,255,255,0.3); letter-spacing: 2px; margin-top: -2px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .status-dot.green { background: #34d399; }
+        .status-dot.red { background: #f43f5e; }
+        .status-dot.yellow { background: #fbbf24; }
+        .profit { color: #34d399; }
+        .loss { color: #f43f5e; }
+        .compact-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+        .compact-stat { background: rgba(31, 41, 55, 0.3); padding: 8px 4px; border-radius: 8px; text-align: center; }
+        .compact-stat .value { font-size: 14px; font-weight: bold; font-family: monospace; }
+        .compact-stat .label { font-size: 7px; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.5px; margin-top: 2px; }
+        .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(15, 15, 26, 0.95); backdrop-filter: blur(20px); border-top: 1px solid rgba(75, 85, 99, 0.3); display: flex; justify-content: space-around; padding: 8px 0 12px 0; z-index: 100; }
+        .nav-item { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; color: #6b7280; cursor: pointer; padding: 4px 12px; border-radius: 8px; background: transparent; border: none; font-family: inherit; }
+        .nav-item.active { color: #34d399; }
+        .nav-item .nav-icon { font-size: 20px; }
+        .nav-item .nav-label { font-size: 8px; letter-spacing: 0.5px; }
+        .page { display: none; padding-bottom: 10px; }
+        .page.active { display: block; }
+        .tab-btn { padding: 4px 12px; border-radius: 6px; font-size: 9px; cursor: pointer; transition: all 0.2s; border: 1px solid rgba(75, 85, 99, 0.3); background: transparent; color: #9ca3af; font-family: inherit; }
+        .tab-btn.active { background: rgba(52, 211, 153, 0.2); border-color: #34d399; color: #34d399; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .chart-container { height: 150px; }
+        .analytics-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+        .analytics-card { background: rgba(31, 41, 55, 0.3); padding: 8px; border-radius: 8px; text-align: center; }
+        .analytics-card .value { font-size: 16px; font-weight: bold; font-family: monospace; }
+        .analytics-card .label { font-size: 7px; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.5px; }
+        .trade-row { padding: 6px 10px; border-bottom: 1px solid rgba(75, 85, 99, 0.15); display: grid; grid-template-columns: 1fr 0.8fr 1fr 0.8fr; gap: 4px; font-size: 11px; align-items: center; }
+        .trade-row .symbol { font-weight: bold; color: #fff; }
+        .trade-row .pnl { font-weight: bold; font-family: monospace; }
+        .trade-row .strategy { color: #9ca3af; font-size: 9px; }
+        .trade-row .status { font-size: 8px; padding: 2px 8px; border-radius: 12px; text-align: center; }
+        .status-badge { background: rgba(52, 211, 153, 0.1); border: 1px solid rgba(52, 211, 153, 0.2); }
+        .status-badge-loss { background: rgba(244, 63, 94, 0.1); border: 1px solid rgba(244, 63, 94, 0.2); }
+        .performer-pill { display: inline-block; background: rgba(31, 41, 55, 0.5); padding: 4px 10px; border-radius: 20px; margin: 2px; font-size: 10px; }
+        .performer-pill .sym { font-weight: bold; color: #fff; }
+        .position-card { padding: 10px 12px; margin-bottom: 6px; }
+        .position-card .symbol { font-size: 14px; font-weight: bold; }
+        .position-card .detail { font-size: 10px; color: #9ca3af; }
+        .position-card .pnl { font-size: 14px; font-weight: bold; font-family: monospace; }
+        .refresh-indicator { font-size: 8px; color: rgba(255,255,255,0.3); text-align: center; margin-top: 20px; }
+        .scroll-container { max-height: 300px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+        .scroll-container::-webkit-scrollbar { width: 3px; }
+        .scroll-container::-webkit-scrollbar-thumb { background: rgba(52, 211, 153, 0.3); border-radius: 10px; }
     </style>
 </head>
-<body class="p-3 md:p-6 max-w-lg mx-auto font-sans antialiased">
-    <header class="flex justify-between items-center mb-5 border-b border-gray-800 pb-3">
+<body class="font-sans antialiased text-gray-100">
+
+    <!-- HEADER -->
+    <header class="p-3 flex justify-between items-center border-b border-gray-700/50 sticky top-0 bg-[#0f0f1a]/90 backdrop-blur-md z-50">
         <div>
-            <div class="flex items-center gap-1.5">
+            <div class="flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-emerald-500 pulse"></span>
-                <h1 class="text-sm font-bold tracking-wider text-emerald-400">MATRIX BOT ALIVE</h1>
+                <div>
+                    <div class="flex items-center gap-1">
+                        <span class="alpha-logo">α</span>
+                        <h1 class="text-base font-bold tracking-wider text-emerald-400 glow">ALPHA</h1>
+                    </div>
+                    <p class="tagline">by ArandaTech</p>
+                </div>
             </div>
-            <p class="text-[10px] text-gray-500">Sync: __SYNC_TIME__</p>
         </div>
-        <div class="text-right text-[11px] font-mono text-gray-400">
-            <div>Margin: <span class="text-white font-bold">₹__MARGIN__</span></div>
-            <div>Value: <span class="text-white font-bold">₹__PORTFOLIO_VALUE__</span></div>
+        <div class="text-right text-[10px] font-mono text-gray-400">
+            <div id="sync-time">Sync: --</div>
+            <div class="flex items-center justify-end gap-3 mt-0.5">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="scan-status" class="text-[9px]">Loading...</span>
+            </div>
         </div>
     </header>
 
-    <div class="card p-4 rounded-xl text-center mb-5 shadow-lg">
-        <p class="text-[10px] text-gray-400 uppercase tracking-widest font-semibold">Today's Floating P&L</p>
-        <p class="text-3xl font-extrabold font-mono mt-1 __PNL_COLOR__">
-            __PREFIX__₹__FLOATING_PNL__ <span class="text-lg font-medium">(__PREFIX____FLOATING_PCT__%)</span>
-        </p>
+    <!-- PAGE 1: OVERVIEW -->
+    <div id="page-overview" class="page active p-3">
+        <div class="card p-2 rounded-xl mb-3 flex justify-between items-center text-[10px]">
+            <span id="market-status">Market: Loading...</span>
+            <span>Scans: <span id="scan-count">0</span> | Signals: <span id="signal-count">0</span></span>
+        </div>
+
+        <div class="card p-4 rounded-xl text-center mb-3">
+            <p class="text-[8px] text-gray-400 uppercase tracking-widest">Today's Floating P&L</p>
+            <p class="text-2xl font-extrabold font-mono mt-1" id="today-pnl">₹0.00</p>
+            <div class="flex justify-center gap-4 mt-1 text-[10px] text-gray-400">
+                <span>Active: <span class="text-white font-bold" id="active-count">0</span></span>
+                <span>Today: <span class="text-white font-bold" id="trades-today">0</span></span>
+            </div>
+        </div>
+
+        <div class="compact-grid mb-3">
+            <div class="compact-stat">
+                <div class="value" id="total-pnl">₹0</div>
+                <div class="label">Total P&L</div>
+            </div>
+            <div class="compact-stat">
+                <div class="value" id="win-rate">0%</div>
+                <div class="label">Win Rate</div>
+            </div>
+            <div class="compact-stat">
+                <div class="value" id="total-trades">0</div>
+                <div class="label">Trades</div>
+            </div>
+            <div class="compact-stat">
+                <div class="value" id="open-trades">0</div>
+                <div class="label">Open</div>
+            </div>
+        </div>
+
+        <div class="card p-2 rounded-xl mb-3">
+            <p class="text-[8px] text-gray-400 uppercase tracking-wider mb-1">🏆 Top Stocks</p>
+            <div id="top-performers" class="flex flex-wrap gap-1">
+                <span class="text-[10px] text-gray-500">Loading...</span>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-2">
+            <button onclick="switchPage('positions')" class="card p-2 rounded-xl text-center text-[9px] text-gray-400 hover:text-white transition">
+                📊 Positions
+            </button>
+            <button onclick="switchPage('trades')" class="card p-2 rounded-xl text-center text-[9px] text-gray-400 hover:text-white transition">
+                📈 Trades
+            </button>
+            <button onclick="switchPage('analytics')" class="card p-2 rounded-xl text-center text-[9px] text-gray-400 hover:text-white transition">
+                📉 Analytics
+            </button>
+        </div>
     </div>
 
-    <section class="mb-6">
-        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-3">Active Tactical Holdings (__POSITIONS_COUNT__)</h2>
-        <div class="space-y-3" id="positions-root"></div>
-    </section>
-
-    <section class="mb-10">
-        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-2">Today's Closed Battle Log</h2>
-        <div class="card rounded-xl overflow-hidden text-xs">
-            <table class="w-full text-left font-mono">
-                <thead class="bg-gray-800 text-[10px] text-gray-400 border-b border-gray-700">
-                    <tr>
-                        <th class="p-2.5">Symbol</th>
-                        <th class="p-2.5">P&L</th>
-                        <th class="p-2.5 text-right">Status</th>
-                    </tr>
-                </thead>
-                <tbody id="history-table-root"></tbody>
-            </table>
+    <!-- PAGE 2: POSITIONS -->
+    <div id="page-positions" class="page p-3">
+        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-2">📊 Active Positions</h2>
+        <div id="positions-root" class="space-y-1.5">
+            <div class="card p-4 rounded-xl text-center text-xs text-gray-500">Loading...</div>
         </div>
-    </section>
+    </div>
 
+    <!-- PAGE 3: TRADES -->
+    <div id="page-trades" class="page p-3">
+        <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase mb-2">📈 Recent Trades</h2>
+        <div class="card rounded-xl overflow-hidden">
+            <div id="history-root">
+                <div class="p-4 text-center text-xs text-gray-500">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PAGE 4: ANALYTICS -->
+    <div id="page-analytics" class="page p-3">
+        <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs font-bold text-gray-400 tracking-wider uppercase">📉 Analytics</h2>
+            <div class="flex gap-1">
+                <button class="tab-btn active" data-tab="daily" onclick="switchAnalyticsTab('daily')">Daily</button>
+                <button class="tab-btn" data-tab="weekly" onclick="switchAnalyticsTab('weekly')">Weekly</button>
+                <button class="tab-btn" data-tab="monthly" onclick="switchAnalyticsTab('monthly')">Monthly</button>
+            </div>
+        </div>
+
+        <div id="tab-daily" class="tab-content active">
+            <div class="card p-2 rounded-xl">
+                <div class="chart-container"><canvas id="dailyChart"></canvas></div>
+                <div class="analytics-grid mt-2">
+                    <div class="analytics-card"><div class="value profit" id="daily-today">₹0</div><div class="label">Today</div></div>
+                    <div class="analytics-card"><div class="value profit" id="daily-best">₹0</div><div class="label">Best Day</div></div>
+                    <div class="analytics-card"><div class="value loss" id="daily-worst">₹0</div><div class="label">Worst Day</div></div>
+                    <div class="analytics-card"><div class="value" id="daily-avg" style="color: #fbbf24;">₹0</div><div class="label">Avg Day</div></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-weekly" class="tab-content">
+            <div class="card p-2 rounded-xl">
+                <div class="chart-container"><canvas id="weeklyChart"></canvas></div>
+                <div class="analytics-grid mt-2">
+                    <div class="analytics-card"><div class="value profit" id="weekly-this">₹0</div><div class="label">This Week</div></div>
+                    <div class="analytics-card"><div class="value profit" id="weekly-best">₹0</div><div class="label">Best Week</div></div>
+                    <div class="analytics-card"><div class="value loss" id="weekly-worst">₹0</div><div class="label">Worst Week</div></div>
+                    <div class="analytics-card"><div class="value" id="weekly-avg" style="color: #fbbf24;">₹0</div><div class="label">Avg Week</div></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-monthly" class="tab-content">
+            <div class="card p-2 rounded-xl">
+                <div class="chart-container"><canvas id="monthlyChart"></canvas></div>
+                <div class="analytics-grid mt-2">
+                    <div class="analytics-card"><div class="value profit" id="monthly-this">₹0</div><div class="label">This Month</div></div>
+                    <div class="analytics-card"><div class="value profit" id="monthly-best">₹0</div><div class="label">Best Month</div></div>
+                    <div class="analytics-card"><div class="value loss" id="monthly-worst">₹0</div><div class="label">Worst Month</div></div>
+                    <div class="analytics-card"><div class="value" id="monthly-avg" style="color: #fbbf24;">₹0</div><div class="label">Avg Month</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- BOTTOM NAVIGATION -->
+    <nav class="bottom-nav">
+        <button class="nav-item active" data-page="overview" onclick="switchPage('overview')">
+            <span class="nav-icon">🏠</span>
+            <span class="nav-label">Overview</span>
+        </button>
+        <button class="nav-item" data-page="positions" onclick="switchPage('positions')">
+            <span class="nav-icon">📊</span>
+            <span class="nav-label">Positions</span>
+        </button>
+        <button class="nav-item" data-page="trades" onclick="switchPage('trades')">
+            <span class="nav-icon">📈</span>
+            <span class="nav-label">Trades</span>
+        </button>
+        <button class="nav-item" data-page="analytics" onclick="switchPage('analytics')">
+            <span class="nav-icon">📉</span>
+            <span class="nav-label">Analytics</span>
+        </button>
+    </nav>
+
+    <div class="refresh-indicator">
+        🔄 Auto-refresh every 30s | Last updated: <span id="last-updated">--</span>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
-        const positionsData = __POSITIONS_JSON__;
-        const historicalTrades = __TRADES_JSON__;
-        
-        const posRoot = document.getElementById('positions-root');
-        if (positionsData.length === 0) {
-            posRoot.innerHTML = `<div class="card p-6 rounded-xl text-center text-xs text-gray-500 font-mono">No active tactical positions held. Engine running indicators sweep...</div>`;
-        } else {
-            positionsData.forEach(pos => {
-                const isProfit = pos.pnl >= 0;
-                const pnlColor = isProfit ? 'text-emerald-400' : 'text-rose-500';
-                const totalRange = pos.target_price - pos.sl_price;
-                const progressPct = totalRange > 0 ? Math.min(100, Math.max(0, ((pos.live_price - pos.sl_price) / totalRange) * 100)) : 50;
+        const API_BASE = 'https://turbine-bust-upload.ngrok-free.dev/api';
+        let dailyChart, weeklyChart, monthlyChart;
 
-                posRoot.innerHTML += `
-                    <div class="card p-3.5 rounded-xl flex flex-col justify-between">
-                        <div class="flex justify-between items-start">
+        function formatCurrency(amount) {
+            if (amount === null || amount === undefined) return '₹0';
+            return `₹${parseFloat(amount).toFixed(2)}`;
+        }
+
+        function switchPage(page) {
+            document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            document.getElementById(`page-${page}`).classList.add('active');
+            document.querySelector(`[data-page="${page}"]`).classList.add('active');
+            if (page === 'analytics') {
+                setTimeout(() => {
+                    if (dailyChart) dailyChart.resize();
+                    if (weeklyChart) weeklyChart.resize();
+                    if (monthlyChart) monthlyChart.resize();
+                }, 100);
+            }
+        }
+
+        function switchAnalyticsTab(tab) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            document.getElementById(`tab-${tab}`).classList.add('active');
+            document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
+        }
+
+        async function loadDashboard() {
+            try {
+                const statsRes = await fetch(`${API_BASE}/stats`);
+                const statsData = await statsRes.json();
+                if (statsData.status === 'success') {
+                    const s = statsData.data;
+                    document.getElementById('total-pnl').textContent = formatCurrency(s.overall?.total_pnl);
+                    document.getElementById('total-trades').textContent = s.overall?.total_trades || 0;
+                    document.getElementById('open-trades').textContent = s.overall?.open_trades || 0;
+                    const closed = s.overall?.closed_trades || 0;
+                    const won = s.overall?.winning_trades || 0;
+                    const wr = closed > 0 ? (won / closed * 100) : 0;
+                    document.getElementById('win-rate').textContent = wr.toFixed(1) + '%';
+                    const todayPnl = s.today?.today_pnl || 0;
+                    const el = document.getElementById('today-pnl');
+                    el.textContent = formatCurrency(todayPnl);
+                    el.style.color = todayPnl >= 0 ? '#34d399' : '#f43f5e';
+                    document.getElementById('trades-today').textContent = s.today?.today_trades || 0;
+                }
+
+                const tradesRes = await fetch(`${API_BASE}/trades`);
+                const tradesData = await tradesRes.json();
+                if (tradesData.status === 'success') {
+                    const trades = tradesData.data || [];
+                    const active = trades.filter(t => t.status === 'OPEN');
+                    const closed = trades.filter(t => t.status === 'CLOSED').slice(0, 15);
+                    document.getElementById('active-count').textContent = active.length;
+                    renderPositions(active);
+                    renderTrades(closed);
+                }
+
+                await loadDailyPNL();
+                await loadWeeklyPNL();
+                await loadMonthlyPNL();
+                await loadTopPerformers();
+
+                const now = new Date();
+                document.getElementById('last-updated').textContent = now.toLocaleTimeString();
+                document.getElementById('sync-time').textContent = `Sync: ${now.toLocaleTimeString()}`;
+            } catch (e) {
+                console.error('Error:', e);
+            }
+        }
+
+        function renderPositions(active) {
+            const root = document.getElementById('positions-root');
+            if (active.length === 0) {
+                root.innerHTML = `<div class="card p-4 rounded-xl text-center text-xs text-gray-500">No active positions</div>`;
+                return;
+            }
+            root.innerHTML = active.map(p => {
+                const pnl = parseFloat(p.pnl || 0);
+                const cls = pnl >= 0 ? 'profit' : 'loss';
+                return `
+                    <div class="card position-card rounded-xl">
+                        <div class="flex justify-between items-center">
                             <div>
-                                <div class="flex items-center gap-1.5">
-                                    <h3 class="text-base font-bold tracking-tight text-white">${pos.symbol}</h3>
-                                    <span class="bg-gray-800 text-gray-400 font-mono text-[9px] px-1.5 py-0.5 rounded font-bold">${pos.strategy}</span>
-                                </div>
-                                <p class="text-[11px] text-gray-400 mt-0.5 font-mono">Qty: ${pos.quantity} | Entry: ₹${pos.entry_price} | Live: ₹${pos.live_price}</p>
+                                <div class="symbol">${p.symbol || 'N/A'}</div>
+                                <div class="detail">${p.strategy || 'N/A'} · Qty: ${p.quantity || 0}</div>
+                                <div class="detail">Entry: ₹${parseFloat(p.entry_price || 0).toFixed(2)}</div>
                             </div>
-                            <div class="text-right font-mono">
-                                <span class="text-sm font-bold ${pnlColor}">${pos.pnl >= 0 ? '+' : ''}₹${pos.pnl}</span>
-                                <div class="text-[10px] ${pnlColor}">(${pos.pnl_pct >= 0 ? '+' : ''}${pos.pnl_pct}%)</div>
+                            <div class="text-right">
+                                <div class="pnl ${cls}">${pnl >= 0 ? '+' : ''}${formatCurrency(pnl)}</div>
+                                <div class="detail">${p.status || 'OPEN'}</div>
                             </div>
                         </div>
-                    </div>`;
-            });
+                    </div>
+                `;
+            }).join('');
         }
 
-        const tableRoot = document.getElementById('history-table-root');
-        if (historicalTrades.length === 0) {
-            tableRoot.innerHTML = `<tr><td colspan="3" class="p-4 text-center text-gray-500 italic">No closed trades recorded during this session.</td></tr>`;
-        } else {
-            historicalTrades.forEach(t => {
-                const pnlColor = t.net_pnl >= 0 ? 'text-emerald-400' : 'text-rose-500';
-                tableRoot.innerHTML += `
-                    <tr class="border-b border-gray-800 hover:bg-gray-800/40 transition">
-                        <td class="p-2.5 font-bold text-white">${t.symbol}<div class="text-[9px] text-gray-500 font-normal">${t.strategy}</div></td>
-                        <td class="p-2.5 ${pnlColor} font-bold">${t.net_pnl >= 0 ? '+' : ''}₹${t.net_pnl.toFixed(2)}</td>
-                        <td class="p-2.5 text-right font-semibold">${t.exit_status}</td>
-                    </tr>`;
-            });
+        function renderTrades(closed) {
+            const root = document.getElementById('history-root');
+            if (closed.length === 0) {
+                root.innerHTML = `<div class="p-4 text-center text-xs text-gray-500">No trades yet</div>`;
+                return;
+            }
+            root.innerHTML = closed.map(t => {
+                const pnl = parseFloat(t.pnl || 0);
+                const cls = pnl >= 0 ? 'profit' : 'loss';
+                const statusCls = pnl >= 0 ? 'status-badge' : 'status-badge-loss';
+                return `
+                    <div class="trade-row">
+                        <span class="symbol">${t.symbol || 'N/A'}</span>
+                        <span class="pnl ${cls}">${pnl >= 0 ? '+' : ''}${formatCurrency(pnl)}</span>
+                        <span class="strategy">${t.strategy || 'N/A'}</span>
+                        <span class="status ${statusCls}">${t.status || 'Closed'}</span>
+                    </div>
+                `;
+            }).join('');
         }
+
+        async function loadTopPerformers() {
+            try {
+                const res = await fetch(`${API_BASE}/performance`);
+                const data = await res.json();
+                const container = document.getElementById('top-performers');
+                if (data.status === 'success' && data.data.best_symbols?.length) {
+                    container.innerHTML = data.data.best_symbols.map(p => `
+                        <span class="performer-pill">
+                            <span class="sym">${p.symbol}</span>
+                            <span class="${p.total_pnl >= 0 ? 'profit' : 'loss'}">${p.total_pnl >= 0 ? '+' : ''}${formatCurrency(p.total_pnl)}</span>
+                        </span>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<span class="text-[10px] text-gray-500">No data</span>';
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        function updateChart(canvasId, labels, values) {
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            if (window[canvasId]) window[canvasId].destroy();
+            const chart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels.length ? labels : ['No Data'],
+                    datasets: [{
+                        data: labels.length ? values : [0],
+                        backgroundColor: labels.length ? values.map(v => v >= 0 ? 'rgba(52,211,153,0.6)' : 'rgba(244,63,94,0.6)') : ['rgba(75,85,99,0.3)'],
+                        borderColor: labels.length ? values.map(v => v >= 0 ? '#34d399' : '#f43f5e') : ['#6b7280'],
+                        borderWidth: 1,
+                        borderRadius: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#9ca3af', font: { size: 8 } } },
+                        x: { grid: { display: false }, ticks: { color: '#9ca3af', font: { size: 7 }, maxRotation: 45 } }
+                    }
+                }
+            });
+            window[canvasId] = chart;
+        }
+
+        function updateStats(period, values) {
+            const last = values[values.length - 1] || 0;
+            const best = Math.max(...values, 0);
+            const worst = Math.min(...values, 0);
+            const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+            const prefix = period === 'daily' ? '' : period === 'weekly' ? 'weekly-' : 'monthly-';
+            document.getElementById(prefix + 'this').textContent = formatCurrency(last);
+            document.getElementById(prefix + 'this').style.color = last >= 0 ? '#34d399' : '#f43f5e';
+            document.getElementById(prefix + 'best').textContent = formatCurrency(best);
+            document.getElementById(prefix + 'worst').textContent = formatCurrency(worst);
+            document.getElementById(prefix + 'avg').textContent = formatCurrency(avg);
+        }
+
+        async function loadDailyPNL() {
+            try {
+                const res = await fetch(`${API_BASE}/daily_pnl`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const d = data.data;
+                    const labels = d.map(x => x.date);
+                    const values = d.map(x => parseFloat(x.daily_pnl || 0));
+                    updateChart('dailyChart', labels, values);
+                    updateStats('daily', values);
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadWeeklyPNL() {
+            try {
+                const res = await fetch(`${API_BASE}/weekly_pnl`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const d = data.data;
+                    const labels = d.map(x => x.week);
+                    const values = d.map(x => parseFloat(x.weekly_pnl || 0));
+                    updateChart('weeklyChart', labels, values);
+                    updateStats('weekly', values);
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadMonthlyPNL() {
+            try {
+                const res = await fetch(`${API_BASE}/monthly_pnl`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const d = data.data;
+                    const labels = d.map(x => x.month);
+                    const values = d.map(x => parseFloat(x.monthly_pnl || 0));
+                    updateChart('monthlyChart', labels, values);
+                    updateStats('monthly', values);
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadMarketStatus() {
+            try {
+                const res = await fetch(`${API_BASE}/market_status`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    document.getElementById('market-status').textContent = data.data;
+                    const dot = document.getElementById('status-dot');
+                    dot.className = `status-dot ${data.is_open ? 'green' : 'red'}`;
+                    document.getElementById('scan-status').textContent = data.is_open ? '🟢 Open' : '🔴 Closed';
+                }
+            } catch (e) {
+                const now = new Date();
+                const isWeekend = now.getDay() === 0 || now.getDay() === 6;
+                document.getElementById('market-status').textContent = isWeekend ? '📅 Weekend' : '🟢 Open';
+                document.getElementById('status-dot').className = `status-dot ${isWeekend ? 'red' : 'green'}`;
+                document.getElementById('scan-status').textContent = isWeekend ? '🔴 Closed' : '🟢 Open';
+            }
+        }
+
+        loadDashboard();
+        loadMarketStatus();
+        setInterval(loadDashboard, 30000);
     </script>
 </body>
-</html>
-"""
-            # Safe token substitution block
+</html>"""
+
             html_payload = html_template\
                 .replace("__SYNC_TIME__", datetime.now().strftime('%I:%M:%S %p'))\
                 .replace("__MARGIN__", f"{self.available_capital:.2f}")\
                 .replace("__PORTFOLIO_VALUE__", f"{total_portfolio_value:.2f}")\
                 .replace("__PNL_COLOR__", pnl_color_class)\
                 .replace("__PREFIX__", pnl_prefix)\
-                .replace("__FLOATING_PNL__", f"{total_floating_pnl:.2f}")\
-                .replace("__FLOATING_PCT__", f"{floating_pct:.2f}")\
+                .replace("__FLOATING_PNL__", f"{abs(total_floating_pnl):.2f}")\
+                .replace("__FLOATING_PCT__", f"{abs(floating_pct):.2f}")\
                 .replace("__POSITIONS_COUNT__", str(len(formatted_positions)))\
-                .replace("__POSITIONS_JSON__", json.dumps(formatted_positions))\
-                .replace("__TRADES_JSON__", json.dumps(self.trades))
+                .replace("__POSITIONS_JSON__", positions_json)\
+                .replace("__TRADES_JSON__", trades_json)\
+                .replace("__BOT_STATUS__", "ACTIVE 🟢" if self.running else "STOPPED 🔴")\
+                .replace("__SCAN_STATUS__", status_message[:50])\
+                .replace("__SCAN_COUNT__", str(self.scan_count))\
+                .replace("__STOCKS_SCORED__", str(self.stocks_scored))\
+                .replace("__SIGNALS_FOUND__", str(self.signals_found))
 
-            with open("dashboard.html", "w", encoding="utf-8") as out:
+            with open("dashboard_backup.html", "w", encoding="utf-8") as out:
                 out.write(html_payload)
             
-            # Send live update to GitHub Pages deployment pipeline
             self.sync_to_github_pages(html_payload)
                 
         except Exception as e:
-            logger.error(f"[DASHBOARD LIFE-CYCLE ERROR] Compiler layout drop: {e}")
+            logger.error(f"[DASHBOARD ERROR] {e}")
+
+    # ============================================================
+    # MARKET STATUS CHECK
+    # ============================================================
+
+    def fetch_nse_holidays(self):
+        try:
+            headers = {'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            endpoint = "https://www.nseindia.com/api/holiday-master?type=trading"
+            response = requests.get(endpoint, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                holidays = []
+                
+                if 'FO' in data:
+                    for item in data['FO']:
+                        if 'tradingDate' in item:
+                            holidays.append(item['tradingDate'])
+                
+                if 'equity' in data:
+                    for item in data['equity']:
+                        if 'tradingDate' in item:
+                            holidays.append(item['tradingDate'])
+                
+                return list(set(holidays))
+            return []
+        except Exception as e:
+            logger.error(f"Failed to fetch holidays: {e}")
+            return []
+
+    def is_trading_day(self, check_date=None):
+        if check_date is None:
+            check_date = datetime.now().date()
+        
+        if check_date.weekday() >= 5:
+            return False
+        
+        holidays = self.fetch_nse_holidays()
+        date_str = check_date.strftime("%Y-%m-%d")
+        
+        if date_str in holidays:
+            return False
+        
+        return True
+
+    def check_market_status(self):
+        today = datetime.now().date()
+        current_time = datetime.now().time()
+        market_open = datetime.strptime("09:15", "%H:%M").time()
+        market_close = datetime.strptime("15:30", "%H:%M").time()
+        
+        if not self.is_trading_day(today):
+            if today.weekday() >= 5:
+                status = f"📅 Market Closed - Weekend ({today.strftime('%A')})"
+            else:
+                status = "📅 Market Closed - Holiday"
+            
+            self.scan_status = status
+            self.market_condition = status
+            logger.info(f"⏳ {status}")
+            return False, status
+        
+        if current_time < market_open:
+            status = f"⏰ Market Opens at 09:15 AM"
+            self.scan_status = status
+            self.market_condition = status
+            logger.info(f"⏳ {status}")
+            return False, status
+        
+        if current_time > market_close:
+            status = "⏰ Market Closed for Today"
+            self.scan_status = status
+            self.market_condition = status
+            logger.info(f"⏳ {status}")
+            return False, status
+        
+        status = "✅ Market OPEN - Trading Active"
+        self.scan_status = status
+        self.market_condition = "📈 LIVE MARKET"
+        logger.info(f"✅ {status}")
+        return True, status
+
+    # ============================================================
+    # MAIN RUN LOOP
+    # ============================================================
 
     def run(self):
-        """Main orchestrator running loops on set intervals."""
+        init_database()
+        
+        logger.info("="*60)
+        logger.info("⚡ ALPHA by ArandaTech - STARTUP")
+        logger.info("="*60)
+        logger.info(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"💰 Initial Capital: ₹{self.capital}")
+        logger.info(f"📊 Max Positions: {MAX_POSITIONS}")
+        logger.info(f"🎯 Scan Interval: {SCAN_INTERVAL}s")
+        logger.info(f"📈 Min Signal Score: {MIN_SIGNAL_SCORE}")
+        logger.info(f"🔒 Leverage: {LEVERAGE}x")
+        logger.info("="*60)
+        logger.info("📋 FEATURES ENABLED:")
+        logger.info(f"   ✅ Dynamic SL: {'Enabled' if ENABLE_DYNAMIC_SL else 'Disabled'}")
+        logger.info(f"   ✅ ATR Sizing: {'Enabled' if ENABLE_ATR_POSITION_SIZING else 'Disabled'}")
+        logger.info(f"   ✅ Correlation Filter: {'Enabled' if ENABLE_CORRELATION_FILTER else 'Disabled'}")
+        logger.info(f"   ✅ Sector Divers.: {'Enabled' if ENABLE_SECTOR_DIVERSIFICATION else 'Disabled'}")
+        logger.info(f"   ✅ Volatility SL: {'Enabled' if ENABLE_VOLATILITY_STOP else 'Disabled'}")
+        logger.info(f"   ✅ Trailing Stop Loss: Active")
+        logger.info(f"   ✅ Partial Profit Taking: Active")
+        logger.info(f"   ✅ Data Source: Angel One API (Primary) + Yahoo (Fallback)")
+        logger.info("="*60)
+        
+        logger.info("📅 Checking market status...")
+        
+        is_open, status = self.check_market_status()
+        
+        if not is_open:
+            logger.info(f"💤 Market closed. Status: {status}")
+            
+            if "Weekend" in status or "Holiday" in status:
+                today = datetime.now().date()
+                days_to_add = 1
+                while True:
+                    next_day = today + timedelta(days=days_to_add)
+                    if self.is_trading_day(next_day):
+                        break
+                    days_to_add += 1
+                
+                next_trading_date = today + timedelta(days=days_to_add)
+                next_trading_time = datetime.combine(next_trading_date, datetime.strptime("09:15", "%H:%M").time())
+                seconds_to_wait = (next_trading_time - datetime.now()).total_seconds()
+                hours = int(seconds_to_wait // 3600)
+                minutes = int((seconds_to_wait % 3600) // 60)
+                logger.info(f"⏰ Sleeping for {hours}h {minutes}m until next trading day...")
+                time.sleep(seconds_to_wait)
+                self.run()
+                return
+            
+            elif "Opens at" in status:
+                today = datetime.now().date()
+                market_open_time = datetime.combine(today, datetime.strptime("09:15", "%H:%M").time())
+                seconds_to_wait = (market_open_time - datetime.now()).total_seconds()
+                hours = int(seconds_to_wait // 3600)
+                minutes = int((seconds_to_wait % 3600) // 60)
+                logger.info(f"⏰ Sleeping for {hours}h {minutes}m until market opens...")
+                time.sleep(seconds_to_wait)
+                self.run()
+                return
+            
+            elif "Closed for Today" in status:
+                today = datetime.now().date()
+                tomorrow = today + timedelta(days=1)
+                market_open_time = datetime.combine(tomorrow, datetime.strptime("09:15", "%H:%M").time())
+                seconds_to_wait = (market_open_time - datetime.now()).total_seconds()
+                hours = int(seconds_to_wait // 3600)
+                minutes = int((seconds_to_wait % 3600) // 60)
+                logger.info(f"⏰ Sleeping for {hours}h {minutes}m until tomorrow...")
+                time.sleep(seconds_to_wait)
+                self.run()
+                return
+        
+        logger.info("✅ Market is OPEN! Proceeding with login...")
+        
         if not self.login():
+            logger.error("Failed to login. Exiting.")
             return
             
         self.load_symbol_tokens()
+        self.load_sector_mapping()
         
-        # Populate initial tracking stock tickers
         initial_pool = self.fetch_all_stocks()
+        if not initial_pool:
+            logger.error("No stocks found. Exiting.")
+            return
+            
         self.stock_list = [stock['symbol'] for stock in initial_pool][:MAX_STOCKS_TO_SCAN]
         logger.info(f"Targets locked. Scanning {len(self.stock_list)} tickers.")
         
         self.start_websocket()
         
+        self.scan_status = "🔄 Bot running, waiting for market..."
+        self.market_condition = self.get_market_condition()
+        
+        logger.info("="*60)
+        logger.info("⚡ ALPHA by ArandaTech - INITIALIZED")
+        logger.info(f"💰 Capital: ₹{self.capital}")
+        logger.info(f"📊 Max Positions: {MAX_POSITIONS}")
+        logger.info(f"🎯 Scan Interval: {SCAN_INTERVAL}s")
+        logger.info(f"🔒 Leverage: {LEVERAGE}x")
+        logger.info("="*60)
+        
+        scan_count = 0
         while self.running:
             try:
-                # Sync fresh historical technical charts
+                if not self.is_trading_day():
+                    logger.info("📅 Market closed (holiday/weekend). Sleeping until next trading day...")
+                    self.scan_status = "📅 Market Closed"
+                    time.sleep(3600)
+                    continue
+                
+                if not self.is_trading_time():
+                    current_time = datetime.now().time()
+                    market_open = datetime.strptime("09:15", "%H:%M").time()
+                    if current_time < market_open:
+                        self.scan_status = f"⏰ Market Opens at 09:15 AM"
+                    else:
+                        self.scan_status = "⏰ Market Closed for Today"
+                    time.sleep(60)
+                    continue
+                
+                if self.check_daily_loss_limit():
+                    break
+                
+                if self.check_and_square_off():
+                    break
+                
+                if not self.check_ws_health():
+                    logger.warning("[WS] WebSocket issues detected. Using fallback data.")
+                
+                self.market_condition = self.get_market_condition()
                 self.update_bulk_market_data()
-                
-                # Check active open trail boundaries
                 self.check_exits()
-                
-                # Scan for new high probability setups
                 self.scan_and_trade()
-                
-                # Regenerate and deploy web dashboard source
                 self.render_and_deploy_dashboard()
                 
+                scan_count += 1
+                ws_status = "🟢" if self.ws_connected else "🔴"
+                logger.info(f"📊 {ws_status} Status | Positions: {len(self.positions)} | Capital: ₹{self.capital:.2f} | P&L: ₹{self.daily_pnl:.2f} | Scans: {scan_count}")
+                
                 time.sleep(SCAN_INTERVAL)
+                
             except KeyboardInterrupt:
-                logger.info("Deactivating bot session manually...")
+                logger.info("🛑 Bot shutdown initiated by user...")
                 self.running = False
+                self.scan_status = "⏹️ Bot Stopped by User"
+                break
             except Exception as e:
                 logger.error(f"[BOT MAIN LOOP EXCEPTION]: {e}")
+                self.scan_status = f"❌ Error: {str(e)[:50]}"
                 time.sleep(10)
+        
+        self.generate_daily_summary()
+        logger.info("🤖 Bot stopped. Final P&L: ₹{:.2f}".format(self.daily_pnl))
+
+    def shutdown(self):
+        self.running = False
+        self.scan_status = "⏹️ Bot Stopped"
+        if self.sws:
+            try:
+                self.sws.close_connection()
+            except:
+                pass
+        logger.info("Bot shutdown complete.")
 
 
 if __name__ == '__main__':
