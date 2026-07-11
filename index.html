@@ -272,7 +272,6 @@
 
         async function loadDashboard() {
             try {
-                // Load stats
                 const statsRes = await fetch(`${API_BASE}/stats`);
                 const statsData = await statsRes.json();
                 if (statsData.status === 'success') {
@@ -291,7 +290,6 @@
                     document.getElementById('trades-today').textContent = s.today?.today_trades || 0;
                 }
 
-                // Load trades
                 const tradesRes = await fetch(`${API_BASE}/trades`);
                 const tradesData = await tradesRes.json();
                 if (tradesData.status === 'success') {
