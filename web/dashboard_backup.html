@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ALPHA BOT – Operations Console</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        * { -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0a0a0f;
+            color: #e8eaed;
+            padding-bottom: 80px;
+            overflow-x: hidden;
+        }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 3px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(52, 211, 153, 0.3); border-radius: 10px; }
+
+        /* Cards */
+        .card {
+            background: rgba(255, 255, 255, 0.04);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 16px;
+            transition: all 0.2s ease;
+        }
+        .card:active { transform: scale(0.98); }
+
+        /* Status Dot */
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .status-dot.green { background: #34d399; box-shadow: 0 0 12px rgba(52, 211, 153, 0.4); }
+        .status-dot.yellow { background: #fbbf24; box-shadow: 0 0 12px rgba(251, 191, 36, 0.4); }
+        .status-dot.red { background: #f43f5e; box-shadow: 0 0 12px rgba(244, 63, 94, 0.4); }
+        .status-dot.gray { background: #6b7280; }
+
+        /* Gradient Text */
+        .gradient-text {
+            background: linear-gradient(135deg, #34d399, #6ee7b7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        /* Bottom Navigation */
+        .bottom-nav {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(10, 10, 15, 0.95);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            display: flex;
+            justify-content: space-around;
+            padding: 8px 0 12px 0;
+            z-index: 100;
+            padding-bottom: env(safe-area-inset-bottom);
+        }
+        .nav-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+            font-size: 10px;
+            color: #6b7280;
+            cursor: pointer;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: transparent;
+            border: none;
+            font-family: 'Inter', sans-serif;
+            transition: all 0.2s;
+            touch-action: manipulation;
+            position: relative;
+        }
+        .nav-item.active { color: #34d399; }
+        .nav-item .nav-icon { font-size: 22px; line-height: 1; }
+        .nav-item .nav-label { font-size: 9px; font-weight: 500; letter-spacing: 0.3px; }
+        .nav-item .badge {
+            position: absolute;
+            top: 0;
+            right: 4px;
+            background: #f43f5e;
+            color: white;
+            font-size: 8px;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 10px;
+            min-width: 16px;
+            text-align: center;
+        }
+
+        /* Page Transitions */
+        .page { display: none; padding: 16px 16px 20px; animation: fadeIn 0.25s ease; }
+        .page.active { display: block; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* Pulse Animation */
+        .pulse { animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+
+        /* P&L Number */
+        .pnl-positive { color: #34d399; }
+        .pnl-negative { color: #f43f5e; }
+        .pnl-neutral { color: #fbbf24; }
+
+        /* Tabs */
+        .tab-btn {
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: transparent;
+            color: #6b7280;
+            font-family: 'Inter', sans-serif;
+        }
+        .tab-btn.active {
+            background: rgba(52, 211, 153, 0.15);
+            border-color: rgba(52, 211, 153, 0.3);
+            color: #34d399;
+        }
+        .tab-content { display: none; animation: fadeIn 0.2s ease; }
+        .tab-content.active { display: block; }
+
+        /* Chart Container */
+        .chart-container { height: 180px; position: relative; }
+
+        /* Position Card */
+        .position-card {
+            padding: 14px 16px;
+            margin-bottom: 10px;
+            cursor: pointer;
+        }
+        .position-card .symbol { font-size: 16px; font-weight: 700; }
+        .position-card .detail { font-size: 11px; color: #9ca3af; }
+        .position-card .pnl { font-size: 16px; font-weight: 700; font-family: 'Inter', monospace; }
+
+        /* Trade Row */
+        .trade-row {
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            display: grid;
+            grid-template-columns: 0.7fr 0.7fr 1fr 0.6fr;
+            gap: 4px;
+            font-size: 12px;
+            align-items: center;
+        }
+        .trade-row .symbol { font-weight: 600; color: #fff; }
+        .trade-row .pnl { font-weight: 600; font-family: 'Inter', monospace; }
+        .trade-row .strategy { color: #9ca3af; font-size: 10px; }
+        .trade-row .status { font-size: 9px; padding: 2px 10px; border-radius: 12px; text-align: center; font-weight: 500; }
+        .status-badge { background: rgba(52, 211, 153, 0.12); color: #34d399; }
+        .status-badge-loss { background: rgba(244, 63, 94, 0.12); color: #f43f5e; }
+        .status-badge-neutral { background: rgba(251, 191, 36, 0.12); color: #fbbf24; }
+
+        /* Health Row */
+        .health-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: #9ca3af;
+        }
+        .health-item .status-dot { width: 6px; height: 6px; margin-right: 0; }
+
+        /* Stat Card */
+        .stat-card { padding: 12px 14px; text-align: center; }
+        .stat-card .value { font-size: 20px; font-weight: 800; font-family: 'Inter', monospace; }
+        .stat-card .label { font-size: 10px; color: #9ca3af; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+
+        /* Analytics Grid */
+        .analytics-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+
+        /* Performer Pill */
+        .performer-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(255, 255, 255, 0.04);
+            padding: 4px 12px 4px 8px;
+            border-radius: 20px;
+            font-size: 11px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .performer-pill .sym { font-weight: 600; color: #fff; }
+
+        /* Risk Badge */
+        .risk-badge {
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .risk-badge.normal { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+        .risk-badge.high { background: rgba(244, 63, 94, 0.15); color: #f43f5e; }
+        .risk-badge.medium { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+
+        /* Responsive */
+        @media (max-width: 480px) {
+            body { padding: 0 0 80px 0; }
+            .page { padding: 12px 14px 20px; }
+            .stat-card .value { font-size: 18px; }
+            .position-card .symbol { font-size: 15px; }
+        }
+        @media (min-width: 481px) and (max-width: 768px) {
+            body { max-width: 480px; margin: 0 auto; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== PAGE 1: OVERVIEW (MISSION CONTROL) ===== -->
+    <div id="page-overview" class="page active">
+        
+        <!-- Header -->
+        <div class="flex justify-between items-center mb-4">
+            <div>
+                <div class="flex items-center gap-2">
+                    <span class="text-xl font-black gradient-text">α</span>
+                    <h1 class="text-lg font-black tracking-tight text-white">ALPHA BOT</h1>
+                </div>
+                <p class="text-[10px] text-gray-500 font-medium tracking-wider uppercase mt-0.5">Operations Console</p>
+            </div>
+            <div class="text-right">
+                <div class="flex items-center gap-2 justify-end">
+                    <span class="status-dot green pulse" id="status-dot"></span>
+                    <span class="text-[10px] font-medium text-gray-400" id="scan-status">Loading...</span>
+                </div>
+                <p class="text-[10px] text-gray-600 font-mono" id="sync-time">Sync: --</p>
+            </div>
+        </div>
+
+        <!-- Health Status -->
+        <div class="card p-4 mb-4">
+            <div class="flex items-center justify-between mb-3">
+                <div>
+                    <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">System Health</p>
+                    <p class="text-sm font-semibold text-emerald-400" id="health-status">● All systems operational</p>
+                </div>
+                <div class="text-right text-[10px] text-gray-500">
+                    <div>Last Scan: <span class="text-gray-400 font-mono" id="last-scan">--</span></div>
+                    <div>Next Scan: <span class="text-gray-400 font-mono" id="next-scan">--</span></div>
+                </div>
+            </div>
+            <div class="grid grid-cols-4 gap-2">
+                <div class="health-item"><span class="status-dot green"></span>Broker</div>
+                <div class="health-item"><span class="status-dot green"></span>Market</div>
+                <div class="health-item"><span class="status-dot green"></span>Scanner</div>
+                <div class="health-item"><span class="status-dot green"></span>Sync</div>
+            </div>
+        </div>
+
+        <!-- Today's P&L -->
+        <div class="card p-5 text-center mb-4">
+            <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">Today's Floating P&L</p>
+            <p class="text-4xl font-black mt-1" id="today-pnl">₹0.00</p>
+            <p class="text-sm font-medium mt-0.5" id="today-pnl-pct">+0.00%</p>
+            <div class="flex justify-center gap-6 mt-2 text-xs text-gray-500">
+                <span>Open: <span class="text-white font-semibold" id="active-count">0</span></span>
+                <span>Trades: <span class="text-white font-semibold" id="trades-today">0</span></span>
+                <span>Market: <span class="text-white font-semibold" id="market-status">--</span></span>
+            </div>
+        </div>
+
+        <!-- Key Metrics -->
+        <div class="grid grid-cols-4 gap-2 mb-4">
+            <div class="stat-card card">
+                <div class="value" id="total-pnl">₹0</div>
+                <div class="label">Total P&L</div>
+            </div>
+            <div class="stat-card card">
+                <div class="value" id="win-rate">0%</div>
+                <div class="label">Win Rate</div>
+            </div>
+            <div class="stat-card card">
+                <div class="value" id="total-trades">0</div>
+                <div class="label">Trades</div>
+            </div>
+            <div class="stat-card card">
+                <div class="value" id="open-trades">0</div>
+                <div class="label">Open</div>
+            </div>
+        </div>
+
+        <!-- Risk Summary -->
+        <div class="card p-4 mb-4">
+            <div class="flex justify-between items-center">
+                <div>
+                    <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">Risk Summary</p>
+                    <div class="flex items-center gap-3 mt-1">
+                        <span class="risk-badge normal" id="risk-posture">NORMAL</span>
+                        <span class="text-xs text-gray-500">Max Drawdown: <span class="text-gray-300 font-mono" id="max-drawdown">0.00%</span></span>
+                    </div>
+                </div>
+                <div class="text-right">
+                    <p class="text-[10px] text-gray-500">Active Positions</p>
+                    <p class="text-lg font-bold" id="active-positions-count">0</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Open Positions Preview -->
+        <div class="mb-4">
+            <div class="flex justify-between items-center mb-2">
+                <h2 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Open Positions</h2>
+                <span class="text-[10px] text-gray-500" id="open-positions-pnl">Total P&L +₹0</span>
+            </div>
+            <div id="positions-preview-root">
+                <div class="card p-6 text-center text-xs text-gray-500">No open positions</div>
+            </div>
+        </div>
+
+        <!-- Quick Actions -->
+        <div class="grid grid-cols-3 gap-2">
+            <button onclick="switchPage('positions')" class="card p-3 text-center text-[11px] font-medium text-gray-400 hover:text-white transition active:scale-95">
+                📊 Positions
+            </button>
+            <button onclick="switchPage('trades')" class="card p-3 text-center text-[11px] font-medium text-gray-400 hover:text-white transition active:scale-95">
+                📈 Trades
+            </button>
+            <button onclick="switchPage('analytics')" class="card p-3 text-center text-[11px] font-medium text-gray-400 hover:text-white transition active:scale-95">
+                📉 Analytics
+            </button>
+        </div>
+    </div>
+
+    <!-- ===== PAGE 2: POSITIONS ===== -->
+    <div id="page-positions" class="page">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-sm font-bold text-white">Open Positions</h2>
+            <span class="text-xs text-gray-500" id="positions-total-pnl">Total P&L +₹0</span>
+        </div>
+        <div id="positions-root">
+            <div class="card p-6 text-center text-xs text-gray-500">Loading...</div>
+        </div>
+    </div>
+
+    <!-- ===== PAGE 3: TRADES ===== -->
+    <div id="page-trades" class="page">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-sm font-bold text-white">Trade History</h2>
+            <div class="flex gap-1">
+                <button class="tab-btn active" data-filter="all" onclick="filterTrades('all')">All</button>
+                <button class="tab-btn" data-filter="intraday" onclick="filterTrades('intraday')">Intraday</button>
+                <button class="tab-btn" data-filter="swing" onclick="filterTrades('swing')">Swing</button>
+            </div>
+        </div>
+        <div class="card rounded-xl overflow-hidden">
+            <div id="history-root">
+                <div class="p-6 text-center text-xs text-gray-500">No trades yet</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== PAGE 4: ANALYTICS ===== -->
+    <div id="page-analytics" class="page">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-sm font-bold text-white">Performance Analytics</h2>
+            <div class="flex gap-1">
+                <button class="tab-btn active" data-tab="daily" onclick="switchAnalyticsTab('daily')">Daily</button>
+                <button class="tab-btn" data-tab="weekly" onclick="switchAnalyticsTab('weekly')">Weekly</button>
+                <button class="tab-btn" data-tab="monthly" onclick="switchAnalyticsTab('monthly')">Monthly</button>
+            </div>
+        </div>
+
+        <!-- Daily -->
+        <div id="tab-daily" class="tab-content active">
+            <div class="card p-3 rounded-xl mb-3">
+                <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider mb-1">P&L Over Time</p>
+                <div class="chart-container"><canvas id="dailyChart"></canvas></div>
+            </div>
+            <div class="analytics-grid">
+                <div class="card p-3 text-center"><div class="value text-emerald-400" id="daily-today">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Today</div></div>
+                <div class="card p-3 text-center"><div class="value text-emerald-400" id="daily-best">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Best Day</div></div>
+                <div class="card p-3 text-center"><div class="value text-rose-500" id="daily-worst">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Worst Day</div></div>
+                <div class="card p-3 text-center"><div class="value text-amber-400" id="daily-avg">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Avg Day</div></div>
+            </div>
+        </div>
+
+        <!-- Weekly -->
+        <div id="tab-weekly" class="tab-content">
+            <div class="card p-3 rounded-xl mb-3">
+                <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider mb-1">Weekly P&L</p>
+                <div class="chart-container"><canvas id="weeklyChart"></canvas></div>
+            </div>
+            <div class="analytics-grid">
+                <div class="card p-3 text-center"><div class="value text-emerald-400" id="weekly-this">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">This Week</div></div>
+                <div class="card p-3 text-center"><div class="value text-emerald-400" id="weekly-best">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Best Week</div></div>
+                <div class="card p-3 text-center"><div class="value text-rose-500" id="weekly-worst">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Worst Week</div></div>
+                <div class="card p-3 text-center"><div class="value text-amber-400" id="weekly-avg">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Avg Week</div></div>
+            </div>
+        </div>
+
+        <!-- Monthly -->
+        <div id="tab-monthly" class="tab-content">
+            <div class="card p-3 rounded-xl mb-3">
+                <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider mb-1">Monthly P&L</p>
+                <div class="chart-container"><canvas id="monthlyChart"></canvas></div>
+            </div>
+            <div class="analytics-grid">
+                <div class="card p-3 text-center"><div class="value text-emerald-400" id="monthly-this">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">This Month</div></div>
+                <div class="card p-3 text-center"><div class="value text-emerald-400" id="monthly-best">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Best Month</div></div>
+                <div class="card p-3 text-center"><div class="value text-rose-500" id="monthly-worst">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Worst Month</div></div>
+                <div class="card p-3 text-center"><div class="value text-amber-400" id="monthly-avg">₹0</div><div class="text-[9px] text-gray-500 font-medium uppercase tracking-wider">Avg Month</div></div>
+            </div>
+        </div>
+
+        <!-- Top Performers -->
+        <div class="card p-3 mt-3">
+            <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider mb-2">🏆 Top Performers</p>
+            <div id="top-performers" class="flex flex-wrap gap-2">
+                <span class="text-xs text-gray-500">Loading...</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== BOTTOM NAVIGATION ===== -->
+    <nav class="bottom-nav">
+        <button class="nav-item active" data-page="overview" onclick="switchPage('overview')">
+            <span class="nav-icon">🎯</span>
+            <span class="nav-label">Overview</span>
+        </button>
+        <button class="nav-item" data-page="positions" onclick="switchPage('positions')">
+            <span class="nav-icon">📊</span>
+            <span class="nav-label">Positions</span>
+            <span class="badge" id="positions-badge" style="display:none;">0</span>
+        </button>
+        <button class="nav-item" data-page="trades" onclick="switchPage('trades')">
+            <span class="nav-icon">📈</span>
+            <span class="nav-label">Trades</span>
+        </button>
+        <button class="nav-item" data-page="analytics" onclick="switchPage('analytics')">
+            <span class="nav-icon">📉</span>
+            <span class="nav-label">Analytics</span>
+        </button>
+    </nav>
+
+    <div class="text-center text-[8px] text-gray-600 py-3">
+        🔄 Auto-refresh every 30s · <span id="last-updated">--</span>
+    </div>
+
+    <script>
+        const API_BASE = 'https://turbine-bust-upload.ngrok-free.dev/api';
+        let dailyChart, weeklyChart, monthlyChart;
+        let allTrades = [];
+
+        function formatCurrency(amount) {
+            if (amount === null || amount === undefined) return '₹0';
+            return `₹${parseFloat(amount).toFixed(2)}`;
+        }
+
+        function getPnLColor(amount) {
+            if (amount === null || amount === undefined) return 'text-gray-400';
+            return parseFloat(amount) >= 0 ? 'text-emerald-400' : 'text-rose-500';
+        }
+
+        function getPnLClass(amount) {
+            if (amount === null || amount === undefined) return 'pnl-neutral';
+            return parseFloat(amount) >= 0 ? 'pnl-positive' : 'pnl-negative';
+        }
+
+        function switchPage(page) {
+            document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            document.getElementById(`page-${page}`).classList.add('active');
+            document.querySelector(`[data-page="${page}"]`).classList.add('active');
+            if (page === 'analytics') {
+                setTimeout(() => {
+                    if (dailyChart) dailyChart.resize();
+                    if (weeklyChart) weeklyChart.resize();
+                    if (monthlyChart) monthlyChart.resize();
+                }, 150);
+            }
+        }
+
+        function switchAnalyticsTab(tab) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn[data-tab]').forEach(el => el.classList.remove('active'));
+            document.getElementById(`tab-${tab}`).classList.add('active');
+            document.querySelector(`.tab-btn[data-tab="${tab}"]`).classList.add('active');
+        }
+
+        function filterTrades(filter) {
+            document.querySelectorAll('.tab-btn[data-filter]').forEach(el => el.classList.remove('active'));
+            document.querySelector(`.tab-btn[data-filter="${filter}"]`).classList.add('active');
+            renderTrades(allTrades, filter);
+        }
+
+        function renderTrades(trades, filter = 'all') {
+            const root = document.getElementById('history-root');
+            let filtered = trades;
+            if (filter !== 'all') {
+                filtered = trades.filter(t => (t.strategy || '').toLowerCase() === filter);
+            }
+            if (filtered.length === 0) {
+                root.innerHTML = `<div class="p-6 text-center text-xs text-gray-500">No ${filter !== 'all' ? filter : ''} trades yet</div>`;
+                return;
+            }
+            root.innerHTML = filtered.slice(0, 20).map(t => {
+                const pnl = parseFloat(t.pnl || 0);
+                const cls = getPnLClass(pnl);
+                const statusCls = pnl >= 0 ? 'status-badge' : 'status-badge-loss';
+                return `
+                    <div class="trade-row">
+                        <span class="symbol">${t.symbol || 'N/A'}</span>
+                        <span class="pnl ${cls}">${pnl >= 0 ? '+' : ''}${formatCurrency(pnl)}</span>
+                        <span class="strategy">${t.strategy || 'N/A'}</span>
+                        <span class="status ${statusCls}">${t.status || 'Closed'}</span>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderPositions(positions) {
+            const root = document.getElementById('positions-root');
+            const preview = document.getElementById('positions-preview-root');
+            const totalPnl = positions.reduce((sum, p) => sum + parseFloat(p.pnl || 0), 0);
+            const totalPnlEl = document.getElementById('positions-total-pnl');
+            const previewPnlEl = document.getElementById('open-positions-pnl');
+            if (totalPnlEl) totalPnlEl.textContent = `Total P&L ${totalPnl >= 0 ? '+' : ''}${formatCurrency(totalPnl)}`;
+            if (previewPnlEl) previewPnlEl.textContent = `Total P&L ${totalPnl >= 0 ? '+' : ''}${formatCurrency(totalPnl)}`;
+
+            if (positions.length === 0) {
+                const msg = `<div class="card p-6 text-center text-xs text-gray-500">No active positions</div>`;
+                if (root) root.innerHTML = msg;
+                if (preview) preview.innerHTML = msg;
+                document.getElementById('active-positions-count').textContent = '0';
+                document.getElementById('positions-badge').style.display = 'none';
+                return;
+            }
+
+            document.getElementById('active-positions-count').textContent = positions.length;
+            const badge = document.getElementById('positions-badge');
+            badge.textContent = positions.length;
+            badge.style.display = 'block';
+
+            const html = positions.map(p => {
+                const pnl = parseFloat(p.pnl || 0);
+                const cls = getPnLClass(pnl);
+                const entry = parseFloat(p.entry_price || 0);
+                const qty = parseInt(p.quantity || 0);
+                return `
+                    <div class="card position-card">
+                        <div class="flex justify-between items-start">
+                            <div>
+                                <div class="symbol">${p.symbol || 'N/A'}</div>
+                                <div class="detail">${p.strategy || 'N/A'} · Qty ${qty}</div>
+                                <div class="detail">Entry ₹${entry.toFixed(2)}</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="pnl ${cls}">${pnl >= 0 ? '+' : ''}${formatCurrency(pnl)}</div>
+                                <div class="detail">${p.status || 'OPEN'}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            if (root) root.innerHTML = html;
+            if (preview) preview.innerHTML = html.slice(0, 300) + (positions.length > 2 ? `<div class="text-center text-xs text-gray-500 mt-2">+ ${positions.length - 2} more</div>` : '');
+        }
+
+        function updateHealthStatus(stats) {
+            const status = document.getElementById('scan-status');
+            const dot = document.getElementById('status-dot');
+            const health = document.getElementById('health-status');
+            if (stats && stats.overall) {
+                const isHealthy = stats.overall.total_trades > 0 || true;
+                status.textContent = isHealthy ? '🟢 Running' : '🔴 Stopped';
+                dot.className = `status-dot ${isHealthy ? 'green' : 'red'}`;
+                health.textContent = isHealthy ? '● All systems operational' : '● System paused';
+            }
+        }
+
+        async function loadDashboard() {
+            try {
+                const [statsRes, tradesRes] = await Promise.all([
+                    fetch(`${API_BASE}/stats`),
+                    fetch(`${API_BASE}/trades`)
+                ]);
+
+                const statsData = await statsRes.json();
+                const tradesData = await tradesRes.json();
+
+                if (statsData.status === 'success') {
+                    const s = statsData.data;
+                    document.getElementById('total-pnl').textContent = formatCurrency(s.overall?.total_pnl);
+                    document.getElementById('total-trades').textContent = s.overall?.total_trades || 0;
+                    document.getElementById('open-trades').textContent = s.overall?.open_trades || 0;
+                    const closed = s.overall?.closed_trades || 0;
+                    const won = s.overall?.winning_trades || 0;
+                    const wr = closed > 0 ? (won / closed * 100) : 0;
+                    document.getElementById('win-rate').textContent = wr.toFixed(1) + '%';
+                    const todayPnl = s.today?.today_pnl || 0;
+                    const el = document.getElementById('today-pnl');
+                    el.textContent = formatCurrency(todayPnl);
+                    el.className = `text-4xl font-black mt-1 ${getPnLClass(todayPnl)}`;
+                    const pct = (todayPnl / 10000 * 100) || 0;
+                    document.getElementById('today-pnl-pct').textContent = `${todayPnl >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+                    document.getElementById('today-pnl-pct').className = `text-sm font-medium mt-0.5 ${getPnLClass(todayPnl)}`;
+                    document.getElementById('trades-today').textContent = s.today?.today_trades || 0;
+                    updateHealthStatus(s);
+                    // Risk metrics
+                    const totalPnL = s.overall?.total_pnl || 0;
+                    const drawdown = Math.min(0, totalPnL) / 10000 * 100;
+                    document.getElementById('max-drawdown').textContent = `${Math.abs(drawdown).toFixed(2)}%`;
+                    document.getElementById('risk-posture').textContent = Math.abs(drawdown) > 5 ? 'HIGH' : Math.abs(drawdown) > 2 ? 'MEDIUM' : 'NORMAL';
+                    document.getElementById('risk-posture').className = `risk-badge ${Math.abs(drawdown) > 5 ? 'high' : Math.abs(drawdown) > 2 ? 'medium' : 'normal'}`;
+                }
+
+                if (tradesData.status === 'success') {
+                    const trades = tradesData.data || [];
+                    allTrades = trades;
+                    const active = trades.filter(t => t.status === 'OPEN');
+                    const closed = trades.filter(t => t.status === 'CLOSED');
+                    document.getElementById('active-count').textContent = active.length;
+                    document.getElementById('active-positions-count').textContent = active.length;
+                    renderPositions(active);
+                    renderTrades(closed.slice(0, 20), 'all');
+                }
+
+                await loadDailyPNL();
+                await loadWeeklyPNL();
+                await loadMonthlyPNL();
+                await loadTopPerformers();
+
+                const now = new Date();
+                document.getElementById('last-updated').textContent = now.toLocaleTimeString();
+                document.getElementById('sync-time').textContent = `Sync: ${now.toLocaleTimeString()}`;
+                document.getElementById('last-scan').textContent = now.toLocaleTimeString();
+                const next = new Date(now.getTime() + 30000);
+                document.getElementById('next-scan').textContent = next.toLocaleTimeString();
+
+            } catch (e) {
+                console.error('Error:', e);
+            }
+        }
+
+        async function loadTopPerformers() {
+            try {
+                const res = await fetch(`${API_BASE}/performance`);
+                const data = await res.json();
+                const container = document.getElementById('top-performers');
+                if (data.status === 'success' && data.data.best_symbols?.length) {
+                    container.innerHTML = data.data.best_symbols.map(p => `
+                        <span class="performer-pill">
+                            <span class="sym">${p.symbol}</span>
+                            <span class="${parseFloat(p.total_pnl) >= 0 ? 'text-emerald-400' : 'text-rose-500'}">${parseFloat(p.total_pnl) >= 0 ? '+' : ''}${formatCurrency(p.total_pnl)}</span>
+                        </span>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<span class="text-xs text-gray-500">No data yet</span>';
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        function updateChart(canvasId, labels, values, color) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+            if (window[canvasId]) window[canvasId].destroy();
+            const chart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels.length ? labels : ['No Data'],
+                    datasets: [{
+                        data: labels.length ? values : [0],
+                        backgroundColor: labels.length ? values.map(v => v >= 0 ? 'rgba(52,211,153,0.5)' : 'rgba(244,63,94,0.5)') : ['rgba(75,85,99,0.3)'],
+                        borderColor: labels.length ? values.map(v => v >= 0 ? '#34d399' : '#f43f5e') : ['#6b7280'],
+                        borderWidth: 1,
+                        borderRadius: 3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7280', font: { size: 9 } } },
+                        x: { grid: { display: false }, ticks: { color: '#6b7280', font: { size: 8 }, maxRotation: 35 } }
+                    }
+                }
+            });
+            window[canvasId] = chart;
+        }
+
+        function updateStats(prefix, values) {
+            const last = values[values.length - 1] || 0;
+            const best = Math.max(...values, 0);
+            const worst = Math.min(...values, 0);
+            const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+            document.getElementById(`${prefix}-this`).textContent = formatCurrency(last);
+            document.getElementById(`${prefix}-this`).className = `value ${getPnLClass(last)}`;
+            document.getElementById(`${prefix}-best`).textContent = formatCurrency(best);
+            document.getElementById(`${prefix}-worst`).textContent = formatCurrency(worst);
+            document.getElementById(`${prefix}-avg`).textContent = formatCurrency(avg);
+        }
+
+        async function loadDailyPNL() {
+            try {
+                const res = await fetch(`${API_BASE}/daily_pnl`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const d = data.data;
+                    updateChart('dailyChart', d.map(x => x.date), d.map(x => parseFloat(x.daily_pnl || 0)));
+                    updateStats('daily', d.map(x => parseFloat(x.daily_pnl || 0)));
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadWeeklyPNL() {
+            try {
+                const res = await fetch(`${API_BASE}/weekly_pnl`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const d = data.data;
+                    updateChart('weeklyChart', d.map(x => x.week), d.map(x => parseFloat(x.weekly_pnl || 0)));
+                    updateStats('weekly', d.map(x => parseFloat(x.weekly_pnl || 0)));
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadMonthlyPNL() {
+            try {
+                const res = await fetch(`${API_BASE}/monthly_pnl`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const d = data.data;
+                    updateChart('monthlyChart', d.map(x => x.month), d.map(x => parseFloat(x.monthly_pnl || 0)));
+                    updateStats('monthly', d.map(x => parseFloat(x.monthly_pnl || 0)));
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadMarketStatus() {
+            try {
+                const res = await fetch(`${API_BASE}/market_status`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    document.getElementById('market-status').textContent = data.is_open ? 'Open' : 'Closed';
+                    const dot = document.getElementById('status-dot');
+                    dot.className = `status-dot ${data.is_open ? 'green' : 'red'}`;
+                    document.getElementById('scan-status').textContent = data.is_open ? '🟢 Running' : '🔴 Stopped';
+                }
+            } catch (e) {
+                document.getElementById('market-status').textContent = '--';
+            }
+        }
+
+        loadDashboard();
+        loadMarketStatus();
+        setInterval(loadDashboard, 30000);
+    </script>
+</body>
+</html>
