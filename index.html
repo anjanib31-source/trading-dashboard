@@ -545,15 +545,20 @@
         }
 
         async function loadDashboard() {
+            // === UPDATE SYNC TIME IMMEDIATELY ===
+            const now = new Date();
+            document.getElementById('sync-time').textContent = `Sync: ${now.toLocaleTimeString()}`;
+            document.getElementById('last-updated').textContent = now.toLocaleTimeString();
+
             try {
                 const [statsRes, tradesRes, healthRes] = await Promise.all([
-                    fetch(`${API_BASE}/stats`),
-                    fetch(`${API_BASE}/trades`),
+                    fetch(`${API_BASE}/stats`).catch(() => null),
+                    fetch(`${API_BASE}/trades`).catch(() => null),
                     fetch(`${API_BASE}/health`).catch(() => null)
                 ]);
 
-                const statsData = await statsRes.json();
-                const tradesData = await tradesRes.json();
+                const statsData = statsRes ? await statsRes.json() : null;
+                const tradesData = tradesRes ? await tradesRes.json() : null;
 
                 // === UPDATE HEALTH STATUS ===
                 if (healthRes && healthRes.ok) {
@@ -593,7 +598,7 @@
                 }
 
                 // === UPDATE STATS ===
-                if (statsData.status === 'success') {
+                if (statsData && statsData.status === 'success') {
                     const s = statsData.data;
                     document.getElementById('total-pnl').textContent = formatCurrency(s.overall?.total_pnl);
                     document.getElementById('total-trades').textContent = s.overall?.total_trades || 0;
@@ -634,7 +639,7 @@
                 }
 
                 // === UPDATE TRADES ===
-                if (tradesData.status === 'success') {
+                if (tradesData && tradesData.status === 'success') {
                     const trades = tradesData.data || [];
                     allTrades = trades;
                     const active = trades.filter(t => t.status === 'OPEN');
@@ -652,12 +657,13 @@
                 await loadTopPerformers();
 
                 // === UPDATE TIMESTAMPS ===
-                const now = new Date();
-                document.getElementById('last-updated').textContent = now.toLocaleTimeString();
-                document.getElementById('sync-time').textContent = `Sync: ${now.toLocaleTimeString()}`;
+                const updated = new Date();
+                document.getElementById('last-updated').textContent = updated.toLocaleTimeString();
+                document.getElementById('sync-time').textContent = `Sync: ${updated.toLocaleTimeString()}`;
 
             } catch (e) {
                 console.error('Error:', e);
+                document.getElementById('sync-time').textContent = 'Sync: ⚠️ Error';
             }
         }
 
