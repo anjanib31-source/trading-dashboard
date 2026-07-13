@@ -225,7 +225,7 @@
             </div>
             <div class="text-right">
                 <div class="flex items-center gap-2 justify-end">
-                    <span class="status-dot green pulse" id="status-dot"></span>
+                    <span class="status-dot gray pulse" id="status-dot"></span>
                     <span class="text-[10px] font-medium text-gray-400" id="scan-status">Loading...</span>
                 </div>
                 <p class="text-[10px] text-gray-600 font-mono" id="sync-time">Sync: --</p>
@@ -237,7 +237,7 @@
             <div class="flex items-center justify-between mb-3">
                 <div>
                     <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">System Health</p>
-                    <p class="text-sm font-semibold text-emerald-400" id="health-status">● All systems operational</p>
+                    <p class="text-sm font-semibold text-gray-400" id="health-status">● Loading...</p>
                 </div>
                 <div class="text-right text-[10px] text-gray-500">
                     <div>Errors: <span class="text-gray-400 font-mono" id="error-count">0</span></div>
@@ -570,7 +570,7 @@
                         
                         // Update main health status
                         statusEl.textContent = h.status || 'Unknown';
-                        statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
+                        statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-amber-400'}`;
                         
                         // Update individual health components
                         const components = ['broker', 'market', 'scanner', 'sync'];
