@@ -597,6 +597,23 @@
                     }
                 }
 
+                // === UPDATE SCAN STATUS ===
+                const statusEl = document.getElementById('scan-status');
+                const healthStatus = document.getElementById('health-status');
+                const marketStatus = document.getElementById('market-status').textContent;
+
+                if (marketStatus === 'Open') {
+                    statusEl.textContent = '🟢 Running';
+                    healthStatus.textContent = '● All systems operational';
+                    healthStatus.className = 'text-sm font-semibold text-emerald-400';
+                } else if (marketStatus === 'Closed') {
+                    statusEl.textContent = '🔴 Stopped (Market Closed)';
+                    healthStatus.textContent = '● Market Closed';
+                    healthStatus.className = 'text-sm font-semibold text-amber-400';
+                } else {
+                    statusEl.textContent = '⏳ Waiting...';
+                }
+
                 // === UPDATE STATS ===
                 if (statsData && statsData.status === 'success') {
                     const s = statsData.data;
