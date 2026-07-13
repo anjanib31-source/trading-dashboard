@@ -216,7 +216,8 @@ def get_market_status():
 def get_health():
     """Get bot health status from health_status.json file"""
     try:
-        health_file = 'health_status.json'
+        # Look in the project root directory
+        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
         if os.path.exists(health_file):
             with open(health_file, 'r') as f:
                 health_data = json.load(f)
@@ -229,16 +230,16 @@ def get_health():
             return jsonify({
                 'status': 'success',
                 'data': {
-                    'status': '✅ All systems operational',
-                    'all_ok': True,
-                    'broker': True,
-                    'market': True,
-                    'scanner': True,
-                    'sync': True,
-                    'last_error': None,
-                    'error_count': 0,
+                    'status': '⚠️ Bot not running',
+                    'all_ok': False,
+                    'broker': False,
+                    'market': False,
+                    'scanner': False,
+                    'sync': False,
+                    'last_error': 'No health data available',
+                    'error_count': 1,
                     'last_heartbeat': datetime.now().isoformat(),
-                    'bot_running': True,
+                    'bot_running': False,
                     'start_time': datetime.now().isoformat()
                 }
             })

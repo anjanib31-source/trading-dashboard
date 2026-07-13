@@ -1785,8 +1785,6 @@ class AngelTradingBot:
         .scroll-container { max-height: 300px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
         .scroll-container::-webkit-scrollbar { width: 3px; }
         .scroll-container::-webkit-scrollbar-thumb { background: rgba(52, 211, 153, 0.3); border-radius: 10px; }
-        .health-error { color: #f43f5e; font-size: 10px; margin-top: 4px; }
-        .health-ok { color: #34d399; }
     </style>
 </head>
 <body class="font-sans antialiased text-gray-100">
@@ -1819,26 +1817,6 @@ class AngelTradingBot:
         <div class="card p-2 rounded-xl mb-3 flex justify-between items-center text-[10px]">
             <span id="market-status">Market: Loading...</span>
             <span>Scans: <span id="scan-count">0</span> | Signals: <span id="signal-count">0</span></span>
-        </div>
-
-        <!-- Health Status -->
-        <div class="card p-4 mb-4">
-            <div class="flex items-center justify-between mb-3">
-                <div>
-                    <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">System Health</p>
-                    <p class="text-sm font-semibold" id="health-status">● All systems operational</p>
-                </div>
-                <div class="text-right text-[10px] text-gray-500">
-                    <div>Errors: <span class="text-gray-400 font-mono" id="error-count">0</span></div>
-                    <div id="health-error" class="health-error hidden"></div>
-                </div>
-            </div>
-            <div class="grid grid-cols-4 gap-2">
-                <div class="health-item"><span class="status-dot green" id="health-broker"></span>Broker</div>
-                <div class="health-item"><span class="status-dot green" id="health-market"></span>Market</div>
-                <div class="health-item"><span class="status-dot green" id="health-scanner"></span>Scanner</div>
-                <div class="health-item"><span class="status-dot green" id="health-sync"></span>Sync</div>
-            </div>
         </div>
 
         <div class="card p-4 rounded-xl text-center mb-3">
@@ -2012,49 +1990,8 @@ class AngelTradingBot:
 
         async function loadDashboard() {
             try {
-                const [statsRes, tradesRes, healthRes] = await Promise.all([
-                    fetch(`${API_BASE}/stats`),
-                    fetch(`${API_BASE}/trades`),
-                    fetch(`${API_BASE}/health`).catch(() => null)
-                ]);
-
+                const statsRes = await fetch(`${API_BASE}/stats`);
                 const statsData = await statsRes.json();
-                const tradesData = await tradesRes.json();
-                
-                // Update health
-                if (healthRes && healthRes.ok) {
-                    const healthData = await healthRes.json();
-                    if (healthData.status === 'success') {
-                        const h = healthData.data;
-                        const statusEl = document.getElementById('health-status');
-                        const dot = document.getElementById('status-dot');
-                        
-                        statusEl.textContent = h.status || 'Unknown';
-                        statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
-                        
-                        // Update individual components
-                        ['broker', 'market', 'scanner', 'sync'].forEach(comp => {
-                            const el = document.getElementById(`health-${comp}`);
-                            if (h[comp]) {
-                                el.className = 'status-dot green';
-                            } else {
-                                el.className = 'status-dot red';
-                            }
-                        });
-                        
-                        // Show error if exists
-                        const errorEl = document.getElementById('health-error');
-                        if (h.last_error) {
-                            errorEl.textContent = `⚠️ ${h.last_error}`;
-                            errorEl.className = 'health-error';
-                        } else {
-                            errorEl.className = 'health-error hidden';
-                        }
-                        
-                        document.getElementById('error-count').textContent = h.error_count || 0;
-                    }
-                }
-
                 if (statsData.status === 'success') {
                     const s = statsData.data;
                     document.getElementById('total-pnl').textContent = formatCurrency(s.overall?.total_pnl);
@@ -2071,6 +2008,8 @@ class AngelTradingBot:
                     document.getElementById('trades-today').textContent = s.today?.today_trades || 0;
                 }
 
+                const tradesRes = await fetch(`${API_BASE}/trades`);
+                const tradesData = await tradesRes.json();
                 if (tradesData.status === 'success') {
                     const trades = tradesData.data || [];
                     const active = trades.filter(t => t.status === 'OPEN');
@@ -2206,8 +2145,10 @@ class AngelTradingBot:
                 const data = await res.json();
                 if (data.status === 'success') {
                     const d = data.data;
-                    updateChart('dailyChart', d.map(x => x.date), d.map(x => parseFloat(x.daily_pnl || 0)));
-                    updateStats('daily', d.map(x => parseFloat(x.daily_pnl || 0)));
+                    const labels = d.map(x => x.date);
+                    const values = d.map(x => parseFloat(x.daily_pnl || 0));
+                    updateChart('dailyChart', labels, values);
+                    updateStats('daily', values);
                 }
             } catch (e) { console.error(e); }
         }
@@ -2218,8 +2159,10 @@ class AngelTradingBot:
                 const data = await res.json();
                 if (data.status === 'success') {
                     const d = data.data;
-                    updateChart('weeklyChart', d.map(x => x.week), d.map(x => parseFloat(x.weekly_pnl || 0)));
-                    updateStats('weekly', d.map(x => parseFloat(x.weekly_pnl || 0)));
+                    const labels = d.map(x => x.week);
+                    const values = d.map(x => parseFloat(x.weekly_pnl || 0));
+                    updateChart('weeklyChart', labels, values);
+                    updateStats('weekly', values);
                 }
             } catch (e) { console.error(e); }
         }
@@ -2230,8 +2173,10 @@ class AngelTradingBot:
                 const data = await res.json();
                 if (data.status === 'success') {
                     const d = data.data;
-                    updateChart('monthlyChart', d.map(x => x.month), d.map(x => parseFloat(x.monthly_pnl || 0)));
-                    updateStats('monthly', d.map(x => parseFloat(x.monthly_pnl || 0)));
+                    const labels = d.map(x => x.month);
+                    const values = d.map(x => parseFloat(x.monthly_pnl || 0));
+                    updateChart('monthlyChart', labels, values);
+                    updateStats('monthly', values);
                 }
             } catch (e) { console.error(e); }
         }

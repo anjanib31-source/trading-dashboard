@@ -244,10 +244,10 @@
                 </div>
             </div>
             <div class="grid grid-cols-4 gap-2">
-                <div class="health-item"><span class="status-dot green" id="health-broker"></span>Broker</div>
-                <div class="health-item"><span class="status-dot green" id="health-market"></span>Market</div>
-                <div class="health-item"><span class="status-dot green" id="health-scanner"></span>Scanner</div>
-                <div class="health-item"><span class="status-dot green" id="health-sync"></span>Sync</div>
+                <div class="health-item"><span class="status-dot gray" id="health-broker"></span>Broker</div>
+                <div class="health-item"><span class="status-dot gray" id="health-market"></span>Market</div>
+                <div class="health-item"><span class="status-dot gray" id="health-scanner"></span>Scanner</div>
+                <div class="health-item"><span class="status-dot gray" id="health-sync"></span>Sync</div>
             </div>
             <div id="health-error" class="health-error hidden"></div>
         </div>
@@ -568,20 +568,28 @@
                         const statusEl = document.getElementById('health-status');
                         const healthError = document.getElementById('health-error');
                         
-                        // Only update health-status if not already set by market status
-                        if (!document.getElementById('market-status').textContent || document.getElementById('market-status').textContent === '--') {
-                            statusEl.textContent = h.status || 'Unknown';
-                            statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
-                        }
+                        // Update main health status
+                        statusEl.textContent = h.status || 'Unknown';
+                        statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
                         
+                        // Update individual health components
                         const components = ['broker', 'market', 'scanner', 'sync'];
-                        components.forEach(comp => {
-                            const el = document.getElementById(`health-${comp}`);
+                        const componentIds = ['health-broker', 'health-market', 'health-scanner', 'health-sync'];
+                        
+                        components.forEach((comp, index) => {
+                            const el = document.getElementById(componentIds[index]);
                             if (el) {
-                                el.className = `status-dot ${h[comp] ? 'green' : 'red'}`;
+                                if (h[comp] === true) {
+                                    el.className = 'status-dot green';
+                                } else if (h[comp] === false) {
+                                    el.className = 'status-dot red';
+                                } else {
+                                    el.className = 'status-dot gray';
+                                }
                             }
                         });
                         
+                        // Show/hide error
                         if (h.last_error) {
                             if (healthError) {
                                 healthError.textContent = `⚠️ ${h.last_error}`;
@@ -593,15 +601,13 @@
                             }
                         }
                         
+                        // Update error count
                         const errorCount = document.getElementById('error-count');
                         if (errorCount) {
                             errorCount.textContent = h.error_count || 0;
                         }
                     }
                 }
-
-                // === SCAN STATUS IS UPDATED BY loadMarketStatus() ===
-                // No duplicate code here
 
                 // === UPDATE STATS ===
                 if (statsData && statsData.status === 'success') {
@@ -780,7 +786,7 @@
                     const dot = document.getElementById('status-dot');
                     dot.className = `status-dot ${isOpen ? 'green' : 'red'}`;
                     
-                    // Update scan status (this fixes the "Loading..." issue)
+                    // Update scan status
                     const statusEl = document.getElementById('scan-status');
                     if (isOpen) {
                         statusEl.textContent = '🟢 Running';
@@ -796,6 +802,12 @@
                     } else {
                         healthStatus.textContent = '● Market Closed';
                         healthStatus.className = 'text-sm font-semibold text-amber-400';
+                    }
+                    
+                    // Also update the Market health dot
+                    const marketDot = document.getElementById('health-market');
+                    if (marketDot) {
+                        marketDot.className = `status-dot ${isOpen ? 'green' : 'red'}`;
                     }
                 }
             } catch (e) {
