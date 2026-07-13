@@ -568,8 +568,11 @@
                         const statusEl = document.getElementById('health-status');
                         const healthError = document.getElementById('health-error');
                         
-                        statusEl.textContent = h.status || 'Unknown';
-                        statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
+                        // Only update health-status if not already set by market status
+                        if (!document.getElementById('market-status').textContent || document.getElementById('market-status').textContent === '--') {
+                            statusEl.textContent = h.status || 'Unknown';
+                            statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
+                        }
                         
                         const components = ['broker', 'market', 'scanner', 'sync'];
                         components.forEach(comp => {
@@ -597,22 +600,8 @@
                     }
                 }
 
-                // === UPDATE SCAN STATUS ===
-                const statusEl = document.getElementById('scan-status');
-                const healthStatus = document.getElementById('health-status');
-                const marketStatus = document.getElementById('market-status').textContent;
-
-                if (marketStatus === 'Open') {
-                    statusEl.textContent = '🟢 Running';
-                    healthStatus.textContent = '● All systems operational';
-                    healthStatus.className = 'text-sm font-semibold text-emerald-400';
-                } else if (marketStatus === 'Closed') {
-                    statusEl.textContent = '🔴 Stopped (Market Closed)';
-                    healthStatus.textContent = '● Market Closed';
-                    healthStatus.className = 'text-sm font-semibold text-amber-400';
-                } else {
-                    statusEl.textContent = '⏳ Waiting...';
-                }
+                // === SCAN STATUS IS UPDATED BY loadMarketStatus() ===
+                // No duplicate code here
 
                 // === UPDATE STATS ===
                 if (statsData && statsData.status === 'success') {
@@ -784,13 +773,35 @@
                 const res = await fetch(`${API_BASE}/market_status`);
                 const data = await res.json();
                 if (data.status === 'success') {
-                    document.getElementById('market-status').textContent = data.is_open ? 'Open' : 'Closed';
+                    const isOpen = data.is_open;
+                    document.getElementById('market-status').textContent = isOpen ? 'Open' : 'Closed';
+                    
+                    // Update status dot
                     const dot = document.getElementById('status-dot');
-                    dot.className = `status-dot ${data.is_open ? 'green' : 'red'}`;
-                    document.getElementById('scan-status').textContent = data.is_open ? '🟢 Running' : '🔴 Stopped';
+                    dot.className = `status-dot ${isOpen ? 'green' : 'red'}`;
+                    
+                    // Update scan status (this fixes the "Loading..." issue)
+                    const statusEl = document.getElementById('scan-status');
+                    if (isOpen) {
+                        statusEl.textContent = '🟢 Running';
+                    } else {
+                        statusEl.textContent = '🔴 Stopped (Market Closed)';
+                    }
+                    
+                    // Update health status text
+                    const healthStatus = document.getElementById('health-status');
+                    if (isOpen) {
+                        healthStatus.textContent = '● All systems operational';
+                        healthStatus.className = 'text-sm font-semibold text-emerald-400';
+                    } else {
+                        healthStatus.textContent = '● Market Closed';
+                        healthStatus.className = 'text-sm font-semibold text-amber-400';
+                    }
                 }
             } catch (e) {
+                console.error('Market status error:', e);
                 document.getElementById('market-status').textContent = '--';
+                document.getElementById('scan-status').textContent = '⏳ Waiting...';
             }
         }
 
