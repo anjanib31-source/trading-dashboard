@@ -160,7 +160,7 @@ def init_database():
 
 
 # ============================================================
-# MAIN BOT CLASS
+# MAIN BOT CLASS WITH HEALTH MONITORING
 # ============================================================
 
 class AngelTradingBot:
@@ -203,6 +203,65 @@ class AngelTradingBot:
         self.last_scan_time = None
         self.scan_status = "🔄 Bot Initializing..."
         self.market_condition = "Unknown"
+        
+        # ===== HEALTH MONITORING =====
+        self.health_status = {
+            'status': '🔄 Initializing...',
+            'all_ok': False,
+            'broker': False,
+            'market': False,
+            'scanner': False,
+            'sync': False,
+            'last_error': None,
+            'error_count': 0,
+            'last_heartbeat': datetime.now().isoformat(),
+            'bot_running': True,
+            'start_time': datetime.now().isoformat()
+        }
+        self._save_health_status()
+
+    # ============================================================
+    # HEALTH MONITORING METHODS
+    # ============================================================
+    
+    def _save_health_status(self):
+        """Save health status to file for API to read"""
+        try:
+            with open('health_status.json', 'w') as f:
+                json.dump(self.health_status, f, default=str)
+        except Exception as e:
+            logger.error(f"[HEALTH] Failed to save health status: {e}")
+    
+    def update_health(self, component=None, status=None, error=None):
+        """Update health status of a component"""
+        with self.lock:
+            if component and status is not None:
+                self.health_status[component] = status
+                logger.info(f"[HEALTH] {component}: {'✅ OK' if status else '❌ FAILED'}")
+            
+            if error:
+                self.health_status['error_count'] += 1
+                self.health_status['last_error'] = error
+                self.health_status['status'] = '⚠️ System Error'
+                logger.error(f"[HEALTH] Error recorded: {error}")
+            
+            # Calculate overall health
+            all_ok = all([
+                self.health_status.get('broker', False),
+                self.health_status.get('market', False),
+                self.health_status.get('scanner', False),
+                self.health_status.get('sync', False),
+                self.health_status.get('bot_running', True)
+            ])
+            
+            self.health_status['all_ok'] = all_ok
+            if not all_ok and not self.health_status.get('last_error'):
+                self.health_status['status'] = '⚠️ System Degraded'
+            elif all_ok:
+                self.health_status['status'] = '✅ All systems operational'
+            
+            self.health_status['last_heartbeat'] = datetime.now().isoformat()
+            self._save_health_status()
 
     # ============================================================
     # DATABASE: SAVE TRADE
@@ -238,6 +297,7 @@ class AngelTradingBot:
             logger.info(f"[DB] Trade saved: {trade_data.get('symbol', 'Unknown')}")
         except Exception as e:
             logger.error(f"[DB] Error saving trade: {e}")
+            self.update_health(error=f"DB Error: {e}")
 
     # ============================================================
     # LOGIN & AUTHENTICATION
@@ -255,17 +315,21 @@ class AngelTradingBot:
                 self.refresh_token = login_data['data']['refreshToken']
                 self.feed_token = self.obj.getfeedToken()
                 logger.info("[OK] API Connected via SmartAPI Session.")
+                self.update_health('broker', True)
                 return True
             else:
                 logger.error(f"[FAIL] Login Failed: {login_data}")
+                self.update_health('broker', False, error=f"Login failed: {login_data}")
                 return False
         except Exception as e:
             logger.error(f"[FAIL] Login Error: {e}")
+            self.update_health('broker', False, error=f"Login error: {e}")
             return False
 
     def load_symbol_tokens(self):
         if not os.path.exists("scrip_master.json"):
             logger.error("[CRITICAL] 'scrip_master.json' missing from directory workspace.")
+            self.update_health(error="scrip_master.json missing")
             return {}
 
         try:
@@ -298,6 +362,7 @@ class AngelTradingBot:
             return symbol_map
         except Exception as e:
             logger.error(f"[CRITICAL] Failed to read or parse local JSON file: {e}")
+            self.update_health(error=f"Symbol load error: {e}")
             return {}
 
     # ============================================================
@@ -320,6 +385,7 @@ class AngelTradingBot:
                 self.sws.connect()
             except Exception as e:
                 logger.error(f"[WS] Execution lifecycle dropped: {e}")
+                self.update_health(error=f"WebSocket error: {e}")
 
         t = threading.Thread(target=run_loop, daemon=True)
         t.start()
@@ -334,9 +400,11 @@ class AngelTradingBot:
     def on_ws_close(self, wsapp, close_status_code, close_msg):
         logger.warning(f"[WS] Disconnected: {close_msg} ({close_status_code})")
         self.ws_connected = False
+        self.update_health('broker', False, error=f"WS disconnected: {close_msg}")
 
     def on_ws_error(self, wsapp, error):
         logger.error(f"[WS] Channel Runtime Error: {error}")
+        self.update_health('broker', False, error=f"WS error: {error}")
 
     def on_ws_data(self, wsapp, message):
         try:
@@ -371,10 +439,12 @@ class AngelTradingBot:
                     logger.info(f"[WS] Active Subscriptions bound to {len(tokens)} runtime symbols.")
             except Exception as e:
                 logger.error(f"[WS] Subscription Error Payload: {e}")
+                self.update_health(error=f"Subscription error: {e}")
 
     def check_ws_health(self):
         if not self.ws_connected:
             logger.warning("[WS] WebSocket disconnected! Attempting reconnect...")
+            self.update_health('broker', False, error="WebSocket disconnected")
             return self._reconnect_websocket()
         
         if self.stock_list:
@@ -387,6 +457,7 @@ class AngelTradingBot:
             
             if stale_count >= 3:
                 logger.warning(f"[WS] {stale_count}/5 prices stale. Reconnecting...")
+                self.update_health('broker', False, error=f"{stale_count}/5 prices stale")
                 return self._reconnect_websocket()
         
         return True
@@ -405,12 +476,15 @@ class AngelTradingBot:
             if self.ws_connected and self.stock_list:
                 self.subscribe_to_stocks()
                 logger.info("[WS] Reconnected and resubscribed successfully!")
+                self.update_health('broker', True)
                 return True
             else:
                 logger.error("[WS] Reconnection failed!")
+                self.update_health('broker', False, error="Reconnection failed")
                 return False
         except Exception as e:
             logger.error(f"[WS] Reconnection error: {e}")
+            self.update_health('broker', False, error=f"Reconnection error: {e}")
             return False
 
     # ============================================================
@@ -780,10 +854,12 @@ class AngelTradingBot:
                 
                 self.generate_daily_summary()
                 self.running = False
+                self.update_health('bot_running', False)
                 return True
             
             logger.info("[SQUARE OFF] No positions to close.")
             self.running = False
+            self.update_health('bot_running', False)
             return True
         
         return False
@@ -794,6 +870,7 @@ class AngelTradingBot:
             logger.warning(f"[RISK] ⚠️ MAX DAILY LOSS REACHED: {daily_loss_pct*100:.2f}%")
             self.scan_status = "⛔ Stopped - Max Daily Loss Reached"
             self.running = False
+            self.update_health('bot_running', False, error=f"Max daily loss: {daily_loss_pct*100:.2f}%")
             return True
         return False
 
@@ -822,6 +899,7 @@ class AngelTradingBot:
             return order_id
         except Exception as e:
             logger.error(f"[ORDER FAILURE] System exception: {e}")
+            self.update_health(error=f"Order failed: {e}")
             return None
 
     def is_trading_time(self):
@@ -854,6 +932,7 @@ class AngelTradingBot:
             logger.info(f"[MARKET ENGINE] Sync completed for {len(self.stock_list)} matrix trackers.")
         except Exception as e:
             logger.error(f"[MARKET ENGINE] Bulk synchronized download failed: {e}")
+            self.update_health(error=f"Market data error: {e}")
 
     def calculate_vwap(self, data):
         try:
@@ -959,151 +1038,25 @@ class AngelTradingBot:
         return 0, "NEUTRAL", "NONE"
 
     # ============================================================
-    # STOCK FETCHING WITH SMART SELECTION
+    # STOCK FETCHING - SIMPLIFIED TO USE FALLBACK DIRECTLY
     # ============================================================
     
     def fetch_all_stocks(self):
         logger.info("="*60)
-        logger.info("📊 FETCHING STOCK LIST - SMART SELECTION SYSTEM")
+        logger.info("📊 USING HARDCODED FALLBACK STOCKS")
         logger.info("="*60)
-        
-        tier_methods = [
-            ("TIER 1: nsepython NIFTY 500", self._fetch_nsepython_nifty500),
-            ("TIER 2: nsepython NIFTY 50 + NEXT 50", self._fetch_nsepython_nifty50_next),
-            ("TIER 3: Official NSE EQUITY_L.csv", self._fetch_nse_equity_csv),
-            ("TIER 4: NSE Bhavcopy", self._fetch_bhavcopy),
-            ("TIER 5: NSE Website API", self._fetch_nse_website_api),
-            ("TIER 6: Hardcoded Fallback", self._fetch_hardcoded_fallback),
+        return self.fetch_from_yahoo_fallback()
+    
+    def fetch_from_yahoo_fallback(self):
+        fallback_symbols = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+            "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
+            "LT", "AXISBANK", "WIPRO", "MARUTI", "TITAN",
+            "TECHM", "NTPC", "ULTRACEMCO", "M&M", "BAJFINANCE",
+            "SUNPHARMA", "POWERGRID", "NESTLEIND", "HCLTECH",
+            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE"
         ]
-        
-        for tier_name, fetch_method in tier_methods:
-            try:
-                logger.info(f"[{tier_name}] Attempting...")
-                symbols = fetch_method()
-                if symbols and len(symbols) > 10:
-                    logger.info(f"✅ {tier_name} - Loaded {len(symbols)} stocks")
-                    return self.get_prices_bulk(symbols)
-            except Exception as e:
-                logger.warning(f"❌ {tier_name} failed: {e}")
-        
-        logger.error("❌ ALL TIERS FAILED! No stocks loaded.")
-        return []
-    
-    def _fetch_nsepython_nifty500(self):
-        if AUTO_PICK_STOCKS and NSEPYTHON_AVAILABLE:
-            if hasattr(nsepython, 'nse_nifty500'):
-                symbols = nsepython.nse_nifty500()
-                if symbols and len(symbols) > 10:
-                    return symbols
-        return []
-    
-    def _fetch_nsepython_nifty50_next(self):
-        if AUTO_PICK_STOCKS and NSEPYTHON_AVAILABLE:
-            nifty50 = []
-            next_nifty50 = []
-            
-            if hasattr(nsepython, 'nse_nifty50'):
-                nifty50 = nsepython.nse_nifty50()
-            
-            if hasattr(nsepython, 'nse_next_nifty50'):
-                next_nifty50 = nsepython.nse_next_nifty50()
-            
-            all_symbols = list(set(nifty50 + next_nifty50))
-            if all_symbols and len(all_symbols) > 10:
-                return all_symbols
-        return []
-    
-    def _fetch_nse_equity_csv(self):
-        url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-        
-        response = requests.get(url, timeout=30)
-        if response.status_code == 200:
-            content = response.content.decode('utf-8')
-            csv_reader = csv.DictReader(io.StringIO(content))
-            
-            symbols = []
-            for row in csv_reader:
-                symbol = row.get('SYMBOL', '').strip()
-                series = row.get('SERIES', '').strip()
-                
-                if symbol and series in ['EQ', 'BE']:
-                    symbol = symbol.replace('&', '').replace('-', '').replace(' ', '')
-                    symbols.append(symbol)
-            
-            return symbols
-        return []
-    
-    def _fetch_bhavcopy(self):
-        from datetime import datetime, timedelta
-        
-        for days_back in range(5):
-            date = datetime.now() - timedelta(days=days_back)
-            date_str = date.strftime("%d%m%Y")
-            url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
-            
-            try:
-                response = requests.get(url, timeout=30)
-                if response.status_code == 200:
-                    content = response.content.decode('utf-8')
-                    csv_reader = csv.DictReader(io.StringIO(content))
-                    
-                    symbols = []
-                    for row in csv_reader:
-                        symbol = row.get('SYMBOL', '').strip()
-                        if symbol:
-                            symbols.append(symbol)
-                    
-                    if symbols:
-                        return symbols
-            except:
-                continue
-        return []
-    
-    def _fetch_nse_website_api(self):
-        try:
-            url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json'
-            }
-            
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                symbols = [item['symbol'] for item in data.get('data', [])]
-                return symbols
-        except:
-            pass
-        return []
-    
-    def _fetch_hardcoded_fallback(self):
-        nifty50 = [
-            "ADANIPORTS", "ASIANPAINT", "AXISBANK", "BAJFINANCE", "BAJAJFINSV",
-            "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB",
-            "DRREDDY", "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK",
-            "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK",
-            "INDUSINDBK", "INFY", "ITC", "JSWSTEEL", "KOTAKBANK",
-            "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC",
-            "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-            "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TCS",
-            "TECHM", "TITAN", "ULTRACEMCO", "UPL", "WIPRO"
-        ]
-        
-        next_nifty50 = [
-            "ABB", "ADANIENT", "AMBUJACEM", "BANDHANBNK", "BANKBARODA",
-            "BERGEPAINT", "BIOCON", "CANBK", "COLPAL", "DABUR",
-            "DIXON", "FEDERALBNK", "HAVELLS", "HDFCAMC", "ICICIGI",
-            "ICICIPRULI", "IDFCFIRSTB", "INDIGO", "IOC", "MARICO",
-            "MUTHOOTFIN", "NAUKRI", "PAGEIND", "PEL", "PIDILITIND",
-            "PNB", "RBLBANK", "SBICARD", "SHREECEM", "SIEMENS",
-            "SRTRANSFIN", "TATAPOWER", "TORNTPHARM", "TRENT", "VEDL",
-            "ZYDUSLIFE", "MANKIND", "LUPIN", "AUROPHARMA", "MPHASIS",
-            "BAJAJHLDNG", "THERMAX", "PFC", "RECLTD", "IRFC",
-            "HAL", "BEL", "GAIL", "BPCL", "ONGC"
-        ]
-        
-        return list(set(nifty50 + next_nifty50))
+        return self.get_prices_bulk(fallback_symbols)
     
     def get_prices_bulk(self, symbols):
         all_stocks = []
@@ -1475,6 +1428,7 @@ class AngelTradingBot:
                         
         except Exception as e:
             logger.error(f"[EXIT ENGINE ERROR] Exception tracking runtime matrix state: {e}")
+            self.update_health(error=f"Exit check error: {e}")
 
     # ============================================================
     # SCAN AND TRADE WITH DYNAMIC POSITION SIZING
@@ -1495,6 +1449,7 @@ class AngelTradingBot:
         self.last_scan_time = datetime.now()
         self.scan_status = "🔄 Scanning stocks..."
         self.market_condition = self.get_market_condition()
+        self.update_health('scanner', True)
             
         logger.info(f"[SCAN] 🔍 Sweeping downloaded metrics to evaluate trade setups... (Scan #{self.scan_count})")
         logger.info(f"[SCAN] 📊 Market Condition: {self.market_condition}")
@@ -1674,6 +1629,7 @@ class AngelTradingBot:
     def sync_to_github_pages(self, html_content):
         if not GITHUB_PAT or "ghp_" not in GITHUB_PAT:
             logger.error("GitHub PAT missing or invalid.")
+            self.update_health('sync', False, error="GitHub PAT missing")
             return
         
         url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/index.html"
@@ -1701,15 +1657,18 @@ class AngelTradingBot:
                 
                 if push_res.status_code in [200, 201]:
                     logger.info("🚀 [GITHUB PUSH] Dashboard updated successfully.")
+                    self.update_health('sync', True)
                     return 
                 elif push_res.status_code == 409:
                     logger.warning(f"[GITHUB PUSH] 409 Conflict detected. Retry {attempt+1}/3")
                     time.sleep(2)
                 else:
                     logger.error(f"[GITHUB PUSH FAILED] Code: {push_res.status_code} - {push_res.text}")
+                    self.update_health('sync', False, error=f"GitHub push failed: {push_res.status_code}")
                     break
             except Exception as e:
                 logger.error(f"[GITHUB SYNC EXCEPTION] {e}")
+                self.update_health('sync', False, error=f"GitHub sync error: {e}")
                 break
 
     def render_and_deploy_dashboard(self):
@@ -1760,6 +1719,12 @@ class AngelTradingBot:
                 status_message = f"⏰ Market Opens at {TRADING_START}"
             elif len(self.positions) == 0 and self.scan_count == 0:
                 status_message = "🔄 Waiting for signals..."
+
+            # Include health status in dashboard
+            health_status = self.health_status.get('status', 'Unknown')
+            health_all_ok = self.health_status.get('all_ok', False)
+            health_error = self.health_status.get('last_error', '')
+            health_error_count = self.health_status.get('error_count', 0)
             
             html_template = """<!DOCTYPE html>
 <html lang="en">
@@ -1820,6 +1785,8 @@ class AngelTradingBot:
         .scroll-container { max-height: 300px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
         .scroll-container::-webkit-scrollbar { width: 3px; }
         .scroll-container::-webkit-scrollbar-thumb { background: rgba(52, 211, 153, 0.3); border-radius: 10px; }
+        .health-error { color: #f43f5e; font-size: 10px; margin-top: 4px; }
+        .health-ok { color: #34d399; }
     </style>
 </head>
 <body class="font-sans antialiased text-gray-100">
@@ -1852,6 +1819,26 @@ class AngelTradingBot:
         <div class="card p-2 rounded-xl mb-3 flex justify-between items-center text-[10px]">
             <span id="market-status">Market: Loading...</span>
             <span>Scans: <span id="scan-count">0</span> | Signals: <span id="signal-count">0</span></span>
+        </div>
+
+        <!-- Health Status -->
+        <div class="card p-4 mb-4">
+            <div class="flex items-center justify-between mb-3">
+                <div>
+                    <p class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">System Health</p>
+                    <p class="text-sm font-semibold" id="health-status">● All systems operational</p>
+                </div>
+                <div class="text-right text-[10px] text-gray-500">
+                    <div>Errors: <span class="text-gray-400 font-mono" id="error-count">0</span></div>
+                    <div id="health-error" class="health-error hidden"></div>
+                </div>
+            </div>
+            <div class="grid grid-cols-4 gap-2">
+                <div class="health-item"><span class="status-dot green" id="health-broker"></span>Broker</div>
+                <div class="health-item"><span class="status-dot green" id="health-market"></span>Market</div>
+                <div class="health-item"><span class="status-dot green" id="health-scanner"></span>Scanner</div>
+                <div class="health-item"><span class="status-dot green" id="health-sync"></span>Sync</div>
+            </div>
         </div>
 
         <div class="card p-4 rounded-xl text-center mb-3">
@@ -2025,8 +2012,49 @@ class AngelTradingBot:
 
         async function loadDashboard() {
             try {
-                const statsRes = await fetch(`${API_BASE}/stats`);
+                const [statsRes, tradesRes, healthRes] = await Promise.all([
+                    fetch(`${API_BASE}/stats`),
+                    fetch(`${API_BASE}/trades`),
+                    fetch(`${API_BASE}/health`).catch(() => null)
+                ]);
+
                 const statsData = await statsRes.json();
+                const tradesData = await tradesRes.json();
+                
+                // Update health
+                if (healthRes && healthRes.ok) {
+                    const healthData = await healthRes.json();
+                    if (healthData.status === 'success') {
+                        const h = healthData.data;
+                        const statusEl = document.getElementById('health-status');
+                        const dot = document.getElementById('status-dot');
+                        
+                        statusEl.textContent = h.status || 'Unknown';
+                        statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-rose-500'}`;
+                        
+                        // Update individual components
+                        ['broker', 'market', 'scanner', 'sync'].forEach(comp => {
+                            const el = document.getElementById(`health-${comp}`);
+                            if (h[comp]) {
+                                el.className = 'status-dot green';
+                            } else {
+                                el.className = 'status-dot red';
+                            }
+                        });
+                        
+                        // Show error if exists
+                        const errorEl = document.getElementById('health-error');
+                        if (h.last_error) {
+                            errorEl.textContent = `⚠️ ${h.last_error}`;
+                            errorEl.className = 'health-error';
+                        } else {
+                            errorEl.className = 'health-error hidden';
+                        }
+                        
+                        document.getElementById('error-count').textContent = h.error_count || 0;
+                    }
+                }
+
                 if (statsData.status === 'success') {
                     const s = statsData.data;
                     document.getElementById('total-pnl').textContent = formatCurrency(s.overall?.total_pnl);
@@ -2043,8 +2071,6 @@ class AngelTradingBot:
                     document.getElementById('trades-today').textContent = s.today?.today_trades || 0;
                 }
 
-                const tradesRes = await fetch(`${API_BASE}/trades`);
-                const tradesData = await tradesRes.json();
                 if (tradesData.status === 'success') {
                     const trades = tradesData.data || [];
                     const active = trades.filter(t => t.status === 'OPEN');
@@ -2180,10 +2206,8 @@ class AngelTradingBot:
                 const data = await res.json();
                 if (data.status === 'success') {
                     const d = data.data;
-                    const labels = d.map(x => x.date);
-                    const values = d.map(x => parseFloat(x.daily_pnl || 0));
-                    updateChart('dailyChart', labels, values);
-                    updateStats('daily', values);
+                    updateChart('dailyChart', d.map(x => x.date), d.map(x => parseFloat(x.daily_pnl || 0)));
+                    updateStats('daily', d.map(x => parseFloat(x.daily_pnl || 0)));
                 }
             } catch (e) { console.error(e); }
         }
@@ -2194,10 +2218,8 @@ class AngelTradingBot:
                 const data = await res.json();
                 if (data.status === 'success') {
                     const d = data.data;
-                    const labels = d.map(x => x.week);
-                    const values = d.map(x => parseFloat(x.weekly_pnl || 0));
-                    updateChart('weeklyChart', labels, values);
-                    updateStats('weekly', values);
+                    updateChart('weeklyChart', d.map(x => x.week), d.map(x => parseFloat(x.weekly_pnl || 0)));
+                    updateStats('weekly', d.map(x => parseFloat(x.weekly_pnl || 0)));
                 }
             } catch (e) { console.error(e); }
         }
@@ -2208,10 +2230,8 @@ class AngelTradingBot:
                 const data = await res.json();
                 if (data.status === 'success') {
                     const d = data.data;
-                    const labels = d.map(x => x.month);
-                    const values = d.map(x => parseFloat(x.monthly_pnl || 0));
-                    updateChart('monthlyChart', labels, values);
-                    updateStats('monthly', values);
+                    updateChart('monthlyChart', d.map(x => x.month), d.map(x => parseFloat(x.monthly_pnl || 0)));
+                    updateStats('monthly', d.map(x => parseFloat(x.monthly_pnl || 0)));
                 }
             } catch (e) { console.error(e); }
         }
@@ -2263,9 +2283,11 @@ class AngelTradingBot:
                 out.write(html_payload)
             
             self.sync_to_github_pages(html_payload)
+            self.update_health('sync', True)
                 
         except Exception as e:
             logger.error(f"[DASHBOARD ERROR] {e}")
+            self.update_health('sync', False, error=f"Dashboard error: {e}")
 
     # ============================================================
     # MARKET STATUS CHECK
@@ -2326,6 +2348,7 @@ class AngelTradingBot:
             
             self.scan_status = status
             self.market_condition = status
+            self.update_health('market', False)
             logger.info(f"⏳ {status}")
             return False, status
         
@@ -2333,6 +2356,7 @@ class AngelTradingBot:
             status = f"⏰ Market Opens at 09:15 AM"
             self.scan_status = status
             self.market_condition = status
+            self.update_health('market', False)
             logger.info(f"⏳ {status}")
             return False, status
         
@@ -2340,12 +2364,14 @@ class AngelTradingBot:
             status = "⏰ Market Closed for Today"
             self.scan_status = status
             self.market_condition = status
+            self.update_health('market', False)
             logger.info(f"⏳ {status}")
             return False, status
         
         status = "✅ Market OPEN - Trading Active"
         self.scan_status = status
         self.market_condition = "📈 LIVE MARKET"
+        self.update_health('market', True)
         logger.info(f"✅ {status}")
         return True, status
 
@@ -2376,6 +2402,7 @@ class AngelTradingBot:
         logger.info(f"   ✅ Partial Profit Taking: Active")
         logger.info(f"   ✅ Data Source: Angel One API (Primary) + Yahoo (Fallback)")
         logger.info("="*60)
+        self.update_health('bot_running', True)
         
         logger.info("📅 Checking market status...")
         
@@ -2430,6 +2457,7 @@ class AngelTradingBot:
         
         if not self.login():
             logger.error("Failed to login. Exiting.")
+            self.update_health('broker', False, error="Login failed")
             return
             
         self.load_symbol_tokens()
@@ -2438,10 +2466,12 @@ class AngelTradingBot:
         initial_pool = self.fetch_all_stocks()
         if not initial_pool:
             logger.error("No stocks found. Exiting.")
+            self.update_health('scanner', False, error="No stocks found")
             return
             
         self.stock_list = [stock['symbol'] for stock in initial_pool][:MAX_STOCKS_TO_SCAN]
         logger.info(f"Targets locked. Scanning {len(self.stock_list)} tickers.")
+        self.update_health('scanner', True)
         
         self.start_websocket()
         
@@ -2500,18 +2530,22 @@ class AngelTradingBot:
                 logger.info("🛑 Bot shutdown initiated by user...")
                 self.running = False
                 self.scan_status = "⏹️ Bot Stopped by User"
+                self.update_health('bot_running', False)
                 break
             except Exception as e:
                 logger.error(f"[BOT MAIN LOOP EXCEPTION]: {e}")
                 self.scan_status = f"❌ Error: {str(e)[:50]}"
+                self.update_health(error=f"Main loop error: {e}")
                 time.sleep(10)
         
         self.generate_daily_summary()
+        self.update_health('bot_running', False)
         logger.info("🤖 Bot stopped. Final P&L: ₹{:.2f}".format(self.daily_pnl))
 
     def shutdown(self):
         self.running = False
         self.scan_status = "⏹️ Bot Stopped"
+        self.update_health('bot_running', False)
         if self.sws:
             try:
                 self.sws.close_connection()

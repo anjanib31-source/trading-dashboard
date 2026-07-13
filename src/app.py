@@ -208,5 +208,42 @@ def get_market_status():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
+# ============================================================
+# HEALTH ENDPOINT - For Dashboard Health Monitoring
+# ============================================================
+
+@app.route('/api/health')
+def get_health():
+    """Get bot health status from health_status.json file"""
+    try:
+        health_file = 'health_status.json'
+        if os.path.exists(health_file):
+            with open(health_file, 'r') as f:
+                health_data = json.load(f)
+            return jsonify({
+                'status': 'success',
+                'data': health_data
+            })
+        else:
+            # Return default health if no data
+            return jsonify({
+                'status': 'success',
+                'data': {
+                    'status': '✅ All systems operational',
+                    'all_ok': True,
+                    'broker': True,
+                    'market': True,
+                    'scanner': True,
+                    'sync': True,
+                    'last_error': None,
+                    'error_count': 0,
+                    'last_heartbeat': datetime.now().isoformat(),
+                    'bot_running': True,
+                    'start_time': datetime.now().isoformat()
+                }
+            })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
