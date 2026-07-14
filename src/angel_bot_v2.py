@@ -1177,6 +1177,10 @@ class AngelTradingBot:
                 except Exception as e:
                     continue
             
+            if not stock_data:
+                logger.warning("⚠️ No surge candidates found. Falling back to simple symbol price selection.")
+                return self.get_prices_fallback(symbols)
+
             stock_data.sort(key=lambda x: x['score'], reverse=True)
             selected = stock_data[:MAX_STOCKS_TO_SCAN]
             
@@ -1217,6 +1221,10 @@ class AngelTradingBot:
         
         logger.info(f"✅ Filtered to {len(all_stocks)} stocks (price: ₹{MIN_STOCK_PRICE}-₹{MAX_STOCK_PRICE})")
         
+        if not all_stocks:
+            logger.warning("⚠️ No stocks passed the primary filter. Falling back to simple symbol price selection.")
+            return self.get_prices_fallback(symbols)
+
         return all_stocks
 
     def get_prices_fallback(self, symbols):
@@ -1228,8 +1236,6 @@ class AngelTradingBot:
         for symbol in limit_symbols:
             try:
                 token = self.symbol_tokens.get(symbol)
-                if not token:
-                    continue
                 
                 stock = yf.Ticker(f"{symbol}.NS")
                 data = stock.history(period="1d")
@@ -1241,9 +1247,27 @@ class AngelTradingBot:
                             'token': token,
                             'price': price
                         })
-            except Exception as e:
+            except Exception:
                 continue
         
+        if not all_stocks:
+            logger.warning("⚠️ Fallback price scan returned no valid stocks. Attempting a broader fallback.")
+            for symbol in limit_symbols:
+                try:
+                    stock = yf.Ticker(f"{symbol}.NS")
+                    data = stock.history(period="5d")
+                    if not data.empty:
+                        price = float(data['Close'].iloc[-1])
+                        if MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
+                            token = self.symbol_tokens.get(symbol)
+                            all_stocks.append({
+                                'symbol': symbol,
+                                'token': token,
+                                'price': price
+                            })
+                except Exception:
+                    continue
+
         return all_stocks
 
     def calculate_estimated_charges(self, entry_price, exit_price, quantity):
@@ -2409,15 +2433,22 @@ class AngelTradingBot:
         self.load_sector_mapping()
         
         initial_pool = self.fetch_all_stocks()
+        retry_count = 0
+        while not initial_pool and retry_count < 3:
+            retry_count += 1
+            logger.warning(f"⚠️ No stocks found on startup. Retrying in 30s ({retry_count}/3)...")
+            time.sleep(30)
+            initial_pool = self.fetch_all_stocks()
+
         if not initial_pool:
-            logger.error("No stocks found. Exiting.")
-            self.update_health('scanner', False, error="No stocks found")
-            return
-            
-        self.stock_list = [stock['symbol'] for stock in initial_pool][:MAX_STOCKS_TO_SCAN]
-        logger.info(f"Targets locked. Scanning {len(self.stock_list)} tickers.")
-        self.update_health('scanner', True)
-        
+            logger.warning("⚠️ Unable to initialize stock universe after retries. Bot will continue and keep scanning.")
+            self.update_health('scanner', False, error="No stocks found on startup")
+            self.stock_list = []
+        else:
+            self.stock_list = [stock['symbol'] for stock in initial_pool][:MAX_STOCKS_TO_SCAN]
+            logger.info(f"Targets locked. Scanning {len(self.stock_list)} tickers.")
+            self.update_health('scanner', True)
+
         self.start_websocket()
         
         self.scan_status = "🔄 Bot running, waiting for market..."
@@ -2462,6 +2493,20 @@ class AngelTradingBot:
                 self.market_condition = self.get_market_condition()
                 self.update_bulk_market_data()
                 self.check_exits()
+
+                if not self.stock_list:
+                    logger.warning("⚠️ Stock universe is empty. Refreshing universe before next scan.")
+                    new_pool = self.fetch_all_stocks()
+                    if new_pool:
+                        self.stock_list = [stock['symbol'] for stock in new_pool][:MAX_STOCKS_TO_SCAN]
+                        logger.info(f"[UNIVERSE] Recovered {len(self.stock_list)} tickers for scanning.")
+                        if self.ws_connected:
+                            self.subscribe_to_stocks()
+                        self.update_health('scanner', True)
+                    else:
+                        logger.warning("⚠️ Still no stocks available after refresh. Will retry next loop.")
+                        self.update_health('scanner', False, error="No stocks available during runtime")
+
                 self.scan_and_trade()
                 self.render_and_deploy_dashboard()
                 

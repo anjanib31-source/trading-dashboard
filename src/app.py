@@ -192,18 +192,23 @@ def get_market_status():
         now = datetime.now()
         day = now.weekday()
         is_weekend = day >= 5
-        current_time = now.strftime('%H:%M')
-        is_trading_hours = '09:15' <= current_time <= '15:30'
-        is_open = not is_weekend and is_trading_hours
-        if is_open:
-            status = '🟢 Market Open'
-            is_open = True
-        elif is_weekend:
+        market_open_time = datetime.strptime('09:15', '%H:%M').time()
+        market_close_time = datetime.strptime('15:30', '%H:%M').time()
+        current_time = now.time()
+
+        if is_weekend:
             status = '📅 Market Closed - Weekend'
             is_open = False
+        elif current_time < market_open_time:
+            status = f'⏳ Market Opens at {market_open_time.strftime("%I:%M %p")}'
+            is_open = False
+        elif current_time >= market_open_time and current_time < market_close_time:
+            status = '🟢 Market Open'
+            is_open = True
         else:
             status = '🔴 Market Closed - After Hours'
             is_open = False
+
         return jsonify({'status': 'success', 'data': status, 'is_open': is_open})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
