@@ -300,6 +300,68 @@ class AngelTradingBot:
             self.update_health(error=f"DB Error: {e}")
 
     # ============================================================
+    # SAVE OPEN POSITION TO DATABASE
+    # ============================================================
+    
+    def save_position_to_db(self, position_data):
+        """Save open position to database"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Ensure positions table exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    entry_price REAL,
+                    quantity INTEGER,
+                    strategy TEXT,
+                    entry_time TEXT,
+                    status TEXT DEFAULT 'OPEN'
+                )
+            ''')
+            
+            cursor.execute('''
+                INSERT INTO positions (
+                    symbol, entry_price, quantity, strategy, entry_time, status
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                position_data.get('symbol', ''),
+                position_data.get('entry_price', 0),
+                position_data.get('quantity', 0),
+                position_data.get('strategy', ''),
+                position_data.get('entry_time', datetime.now().isoformat()),
+                'OPEN'
+            ))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"[DB] Position saved: {position_data.get('symbol', 'Unknown')}")
+            return True
+        except Exception as e:
+            logger.error(f"[DB] Error saving position: {e}")
+            self.update_health(error=f"DB Position Error: {e}")
+            return False
+
+    def update_position_status(self, symbol, status='CLOSED'):
+        """Update position status in database"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE positions 
+                SET status = ? 
+                WHERE symbol = ? AND status = 'OPEN'
+                ORDER BY entry_time DESC LIMIT 1
+            ''', (status, symbol))
+            conn.commit()
+            conn.close()
+            logger.info(f"[DB] Position status updated: {symbol} -> {status}")
+        except Exception as e:
+            logger.error(f"[DB] Error updating position status: {e}")
+
+    # ============================================================
     # LOGIN & AUTHENTICATION
     # ============================================================
 
@@ -851,6 +913,7 @@ class AngelTradingBot:
                     
                     self.place_order(symbol, "SELL", qty, current_price)
                     logger.info(f"[SQUARE OFF] {symbol}: ₹{position['entry_price']:.2f} → ₹{current_price:.2f}")
+                    self.update_position_status(symbol, 'CLOSED')
                 
                 self.generate_daily_summary()
                 self.running = False
@@ -1353,7 +1416,10 @@ class AngelTradingBot:
                     exit_type = "FULL"
                     exit_qty = qty
                 
-                elif ((datetime.now() - position['entry_time']).total_seconds() / 60) > MAX_HOLD_MINUTES:
+                # === FIXED TIME EXIT WITH DEBUG LOG ===
+                elapsed_minutes = (datetime.now() - position['entry_time']).total_seconds() / 60
+                if elapsed_minutes > MAX_HOLD_MINUTES:
+                    logger.info(f"⏳ [TIME EXIT] {symbol} held for {elapsed_minutes:.0f} minutes (limit: {MAX_HOLD_MINUTES})")
                     exit_triggered = True
                     exit_reason = f"⏳ [TIME EXPIRED] Exited {symbol} at {pnl_pct*100:.2f}%"
                     exit_type = "FULL"
@@ -1446,6 +1512,7 @@ class AngelTradingBot:
                                 'exit_type': 'FULL'
                             })
                             
+                            self.update_position_status(symbol, 'CLOSED')
                             self.positions.remove(position)
                         
                         logger.info(f"{exit_reason} | Fees: ₹{charges:.2f} | Net Yield: ₹{net_pnl:.2f}")
@@ -1566,6 +1633,15 @@ class AngelTradingBot:
                 stop_price = current_price * (1 - final_sl)
                 
                 self.place_order(symbol, "BUY", qty, current_price)
+                
+                position_data = {
+                    'symbol': symbol,
+                    'entry_price': current_price,
+                    'quantity': qty,
+                    'strategy': strategy,
+                    'entry_time': datetime.now().isoformat()
+                }
+                self.save_position_to_db(position_data)
                 
                 self.positions.append({
                     'symbol': symbol, 
