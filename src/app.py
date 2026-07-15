@@ -1,29 +1,154 @@
-from flask import Flask, jsonify, send_from_directory
+"""
+ALPHA Bot - Flask API Server
+Production-ready with logging, rate limiting, health checks, and CORS
+"""
+
+from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 import sqlite3
 import json
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
+from functools import wraps
+import time
+from dotenv import load_dotenv
+import sys
 
+# Load environment variables
+load_dotenv()
+
+# === CONFIGURATION ===
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), 'trades.db'))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+PORT = int(os.getenv("PORT", 5000))
+HOST = os.getenv("HOST", "0.0.0.0")
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+
+# === SETUP LOGGING WITH ROTATION ===
+os.makedirs("logs", exist_ok=True)
+
+# Create root logger
+logger = logging.getLogger()
+logger.setLevel(getattr(logging, LOG_LEVEL))
+
+# Remove any existing handlers
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# Create rotating file handler (10MB, 5 backups)
+file_handler = RotatingFileHandler(
+    'logs/app.log',
+    maxBytes=10*1024*1024,
+    backupCount=5,
+    encoding='utf-8'
+)
+file_handler.setLevel(getattr(logging, LOG_LEVEL))
+
+# Create console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(getattr(logging, LOG_LEVEL))
+
+# Create formatter
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+log = logging.getLogger(__name__)
+
+# === FLASK APP ===
 app = Flask(__name__, static_folder='../web', static_url_path='')
-CORS(app, origins='*')
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'trades.db')
+# === CORS CONFIGURATION ===
+# Allow specific origins or all in development
+if CORS_ORIGINS == ["*"]:
+    CORS(app, origins='*')
+else:
+    CORS(app, origins=CORS_ORIGINS)
 
+# === RATE LIMITING ===
+class RateLimiter:
+    """Simple in-memory rate limiter"""
+    def __init__(self, max_calls_per_minute):
+        self.max_calls = max_calls_per_minute
+        self.calls = {}
+        self.lock = None  # Would use threading.Lock in production
+    
+    def is_allowed(self, client_id):
+        now = time.time()
+        window = now - 60  # Last 60 seconds
+        
+        if client_id not in self.calls:
+            self.calls[client_id] = []
+        
+        # Clean old calls
+        self.calls[client_id] = [t for t in self.calls[client_id] if t > window]
+        
+        if len(self.calls[client_id]) >= self.max_calls:
+            return False
+        
+        self.calls[client_id].append(now)
+        return True
+
+rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE)
+
+def rate_limit(f):
+    """Decorator to apply rate limiting"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        client_id = request.remote_addr or 'unknown'
+        if not rate_limiter.is_allowed(client_id):
+            log.warning(f"Rate limit exceeded for {client_id}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Rate limit exceeded. Please try again later.'
+            }), 429
+        return f(*args, **kwargs)
+    return decorated_function
+
+# === DATABASE FUNCTIONS ===
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Get database connection with timeout"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+    except Exception as e:
+        log.error(f"Database connection failed: {e}")
+        raise
+
+# === ROUTES ===
 
 @app.route('/')
+@rate_limit
 def serve_dashboard():
-    return send_from_directory('../web', 'dashboard.html')
+    """Serve the main dashboard"""
+    try:
+        return send_from_directory('../web', 'dashboard.html')
+    except Exception as e:
+        log.error(f"Failed to serve dashboard: {e}")
+        return jsonify({'status': 'error', 'message': 'Dashboard not found'}), 404
 
 @app.route('/api/trades')
+@rate_limit
 def get_trades():
+    """Get recent trades"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Get limit from query params
+        limit = request.args.get('limit', 500, type=int)
+        limit = min(limit, 1000)  # Cap at 1000
+        
         cursor.execute('''
             SELECT 
                 id, symbol, entry_price, exit_price, quantity,
@@ -34,20 +159,26 @@ def get_trades():
                 exit_type
             FROM trades 
             ORDER BY entry_time DESC
-            LIMIT 500
-        ''')
+            LIMIT ?
+        ''', (limit,))
         trades = [dict(row) for row in cursor.fetchall()]
         conn.close()
+        
+        log.info(f"Returned {len(trades)} trades")
         return jsonify({'status': 'success', 'data': trades, 'count': len(trades)})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_trades: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/positions')
+@rate_limit
 def get_positions():
-    """Get currently open positions from positions table"""
+    """Get currently open positions"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Also get any open positions from trades table
         cursor.execute('''
             SELECT 
                 id,
@@ -64,18 +195,20 @@ def get_positions():
         positions = [dict(row) for row in cursor.fetchall()]
         conn.close()
         
-        # Calculate current P&L for each position using live prices
-        # Note: Live prices are fetched by the dashboard, not here
+        log.info(f"Returned {len(positions)} open positions")
         return jsonify({
             'status': 'success', 
             'data': positions, 
             'count': len(positions)
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_positions: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/stats')
+@rate_limit
 def get_stats():
+    """Get trading statistics"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -137,12 +270,16 @@ def get_stats():
         stats['open_positions_count'] = open_count
         
         conn.close()
+        log.info(f"Stats returned: {stats['overall']['total_trades']} total trades")
         return jsonify({'status': 'success', 'data': stats})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_stats: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/daily_pnl')
+@rate_limit
 def get_daily_pnl():
+    """Get daily P&L for the last 30 days"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -160,10 +297,13 @@ def get_daily_pnl():
         conn.close()
         return jsonify({'status': 'success', 'data': data})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_daily_pnl: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/weekly_pnl')
+@rate_limit
 def get_weekly_pnl():
+    """Get weekly P&L for the last 90 days"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -181,10 +321,13 @@ def get_weekly_pnl():
         conn.close()
         return jsonify({'status': 'success', 'data': data})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_weekly_pnl: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/monthly_pnl')
+@rate_limit
 def get_monthly_pnl():
+    """Get monthly P&L for the last 365 days"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -202,13 +345,18 @@ def get_monthly_pnl():
         conn.close()
         return jsonify({'status': 'success', 'data': data})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_monthly_pnl: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/performance')
+@rate_limit
 def get_performance():
+    """Get performance metrics including win rate and top performers"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Win rate
         cursor.execute('''
             SELECT 
                 COUNT(CASE WHEN exit_time IS NOT NULL AND net_pnl > 0 THEN 1 END) * 100.0 / 
@@ -216,6 +364,8 @@ def get_performance():
             FROM trades
         ''')
         win_rate = cursor.fetchone()[0] or 0
+        
+        # Top performers
         cursor.execute('''
             SELECT 
                 symbol,
@@ -225,19 +375,35 @@ def get_performance():
             GROUP BY symbol ORDER BY total_pnl DESC LIMIT 5
         ''')
         best_symbols = [dict(row) for row in cursor.fetchall()]
+        
+        # Worst performers
+        cursor.execute('''
+            SELECT 
+                symbol,
+                SUM(CASE WHEN exit_time IS NOT NULL THEN net_pnl ELSE 0 END) as total_pnl,
+                COUNT(CASE WHEN exit_time IS NOT NULL THEN 1 END) as trades_count
+            FROM trades WHERE exit_time IS NOT NULL
+            GROUP BY symbol ORDER BY total_pnl ASC LIMIT 3
+        ''')
+        worst_symbols = [dict(row) for row in cursor.fetchall()]
+        
         conn.close()
         return jsonify({
             'status': 'success',
             'data': {
                 'win_rate': round(win_rate, 2),
-                'best_symbols': best_symbols
+                'best_symbols': best_symbols,
+                'worst_symbols': worst_symbols
             }
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_performance: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/market_status')
+@rate_limit
 def get_market_status():
+    """Get current market status"""
     try:
         now = datetime.now()
         day = now.weekday()
@@ -259,26 +425,38 @@ def get_market_status():
             status = '🔴 Market Closed - After Hours'
             is_open = False
 
-        return jsonify({'status': 'success', 'data': status, 'is_open': is_open})
+        return jsonify({
+            'status': 'success', 
+            'data': status, 
+            'is_open': is_open,
+            'timestamp': now.isoformat()
+        })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_market_status: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ============================================================
-# HEALTH ENDPOINT - For Dashboard Health Monitoring
+# HEALTH CHECK ENDPOINTS
 # ============================================================
 
 @app.route('/api/health')
+@rate_limit
 def get_health():
     """Get bot health status from health_status.json file"""
     try:
-        # Look in the project root directory
         health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
         if os.path.exists(health_file):
             with open(health_file, 'r') as f:
                 health_data = json.load(f)
+            
+            # Add API server health
+            health_data['api_server'] = True
+            health_data['api_server_uptime'] = app.config.get('start_time', datetime.now().isoformat())
+            
             return jsonify({
                 'status': 'success',
-                'data': health_data
+                'data': health_data,
+                'timestamp': datetime.now().isoformat()
             })
         else:
             # Return default health if no data
@@ -291,15 +469,138 @@ def get_health():
                     'market': False,
                     'scanner': False,
                     'sync': False,
+                    'api_server': True,
                     'last_error': 'No health data available',
                     'error_count': 1,
                     'last_heartbeat': datetime.now().isoformat(),
                     'bot_running': False,
                     'start_time': datetime.now().isoformat()
-                }
+                },
+                'timestamp': datetime.now().isoformat()
             })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        log.error(f"Error in get_health: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/health/live')
+def live_health():
+    """Simple liveness probe for container orchestration"""
+    return jsonify({
+        'status': 'alive',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/api/health/ready')
+def ready_health():
+    """Readiness probe - checks if API is ready to serve requests"""
+    try:
+        # Check database connectivity
+        conn = get_db_connection()
+        conn.execute('SELECT 1')
+        conn.close()
+        
+        return jsonify({
+            'status': 'ready',
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        log.error(f"Ready check failed: {e}")
+        return jsonify({
+            'status': 'not_ready',
+            'reason': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 503
+
+# ============================================================
+# METRICS ENDPOINT (for monitoring)
+# ============================================================
+
+@app.route('/api/metrics')
+@rate_limit
+def get_metrics():
+    """Get system metrics"""
+    try:
+        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
+        metrics = {}
+        
+        if os.path.exists(health_file):
+            with open(health_file, 'r') as f:
+                health_data = json.load(f)
+                metrics = health_data.get('metrics', {})
+        
+        # Add API server metrics
+        metrics['api_requests'] = {
+            'total': getattr(app, 'total_requests', 0),
+            'errors': getattr(app, 'error_requests', 0)
+        }
+        
+        return jsonify({
+            'status': 'success',
+            'data': metrics,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        log.error(f"Error in get_metrics: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ============================================================
+# REQUEST LOGGING MIDDLEWARE
+# ============================================================
+
+@app.before_request
+def before_request():
+    """Log incoming requests and track metrics"""
+    app.total_requests = getattr(app, 'total_requests', 0) + 1
+    log.info(f"Request: {request.method} {request.path} from {request.remote_addr}")
+
+@app.after_request
+def after_request(response):
+    """Log response and track errors"""
+    if response.status_code >= 400:
+        app.error_requests = getattr(app, 'error_requests', 0) + 1
+        log.warning(f"Error response: {response.status_code} for {request.path}")
+    return response
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    log.error(f"Internal server error: {error}")
+    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+
+@app.errorhandler(429)
+def rate_limit_error(error):
+    return jsonify({
+        'status': 'error',
+        'message': 'Rate limit exceeded. Please try again later.'
+    }), 429
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Store start time
+    app.config['start_time'] = datetime.now().isoformat()
+    
+    log.info("=" * 60)
+    log.info("🚀 ALPHA Bot API Server Starting")
+    log.info("=" * 60)
+    log.info(f"📡 Host: {HOST}")
+    log.info(f"🔌 Port: {PORT}")
+    log.info(f"🐛 Debug: {DEBUG}")
+    log.info(f"📊 Rate Limit: {RATE_LIMIT_PER_MINUTE} requests/min")
+    log.info(f"🌐 CORS Origins: {CORS_ORIGINS}")
+    log.info(f"🗄️ Database: {DB_PATH}")
+    log.info("=" * 60)
+    
+    app.run(debug=DEBUG, host=HOST, port=PORT)
