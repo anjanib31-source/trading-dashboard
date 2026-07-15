@@ -42,6 +42,38 @@ def get_trades():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
+@app.route('/api/positions')
+def get_positions():
+    """Get currently open positions from positions table"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                id,
+                symbol,
+                entry_price,
+                quantity,
+                strategy,
+                entry_time,
+                status
+            FROM positions 
+            WHERE status = 'OPEN'
+            ORDER BY entry_time DESC
+        ''')
+        positions = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        # Calculate current P&L for each position using live prices
+        # Note: Live prices are fetched by the dashboard, not here
+        return jsonify({
+            'status': 'success', 
+            'data': positions, 
+            'count': len(positions)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
 @app.route('/api/stats')
 def get_stats():
     try:
@@ -51,6 +83,8 @@ def get_stats():
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
         month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         stats = {}
+        
+        # Overall stats from trades table
         cursor.execute('''
             SELECT 
                 COUNT(*) as total_trades,
@@ -65,6 +99,8 @@ def get_stats():
             FROM trades
         ''')
         stats['overall'] = dict(cursor.fetchone())
+        
+        # Today's stats
         cursor.execute('''
             SELECT 
                 COUNT(*) as today_trades,
@@ -72,6 +108,8 @@ def get_stats():
             FROM trades WHERE DATE(entry_time) = ?
         ''', (today,))
         stats['today'] = dict(cursor.fetchone())
+        
+        # This week's stats
         cursor.execute('''
             SELECT 
                 COUNT(*) as week_trades,
@@ -79,6 +117,8 @@ def get_stats():
             FROM trades WHERE DATE(entry_time) >= ?
         ''', (week_ago,))
         stats['week'] = dict(cursor.fetchone())
+        
+        # This month's stats
         cursor.execute('''
             SELECT 
                 COUNT(*) as month_trades,
@@ -86,6 +126,16 @@ def get_stats():
             FROM trades WHERE DATE(entry_time) >= ?
         ''', (month_ago,))
         stats['month'] = dict(cursor.fetchone())
+        
+        # Get open positions count from positions table
+        cursor.execute('''
+            SELECT COUNT(*) as open_positions_count
+            FROM positions 
+            WHERE status = 'OPEN'
+        ''')
+        open_count = cursor.fetchone()[0]
+        stats['open_positions_count'] = open_count
+        
         conn.close()
         return jsonify({'status': 'success', 'data': stats})
     except Exception as e:
