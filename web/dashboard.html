@@ -432,6 +432,7 @@
         const API_BASE = '/api';
         let dailyChart, weeklyChart, monthlyChart;
         let allTrades = [];
+        let allPositions = [];
 
         function formatCurrency(amount) {
             if (amount === null || amount === undefined) return '₹0';
@@ -495,21 +496,18 @@
             }).join('');
         }
 
-        function renderPositions(positions) {
+        function renderPositionsFromDB(positions) {
             const root = document.getElementById('positions-root');
             const preview = document.getElementById('positions-preview-root');
-            const totalPnl = positions.reduce((sum, p) => sum + parseFloat(p.pnl || 0), 0);
-            const totalPnlEl = document.getElementById('positions-total-pnl');
-            const previewPnlEl = document.getElementById('open-positions-pnl');
-            if (totalPnlEl) totalPnlEl.textContent = `Total P&L ${totalPnl >= 0 ? '+' : ''}${formatCurrency(totalPnl)}`;
-            if (previewPnlEl) previewPnlEl.textContent = `Total P&L ${totalPnl >= 0 ? '+' : ''}${formatCurrency(totalPnl)}`;
-
-            if (positions.length === 0) {
+            
+            if (!positions || positions.length === 0) {
                 const msg = `<div class="card p-6 text-center text-xs text-gray-500">No active positions</div>`;
                 if (root) root.innerHTML = msg;
                 if (preview) preview.innerHTML = msg;
                 document.getElementById('active-positions-count').textContent = '0';
                 document.getElementById('positions-badge').style.display = 'none';
+                document.getElementById('open-positions-pnl').textContent = 'Total P&L +₹0';
+                document.getElementById('positions-total-pnl').textContent = 'Total P&L +₹0';
                 return;
             }
 
@@ -517,6 +515,12 @@
             const badge = document.getElementById('positions-badge');
             badge.textContent = positions.length;
             badge.style.display = 'block';
+
+            // Calculate total P&L for open positions (using live prices from bot)
+            // Note: P&L is calculated by the bot, not the dashboard
+            const totalPnl = positions.reduce((sum, p) => sum + parseFloat(p.pnl || 0), 0);
+            document.getElementById('open-positions-pnl').textContent = `Total P&L ${totalPnl >= 0 ? '+' : ''}${formatCurrency(totalPnl)}`;
+            document.getElementById('positions-total-pnl').textContent = `Total P&L ${totalPnl >= 0 ? '+' : ''}${formatCurrency(totalPnl)}`;
 
             const html = positions.map(p => {
                 const pnl = parseFloat(p.pnl || 0);
@@ -541,7 +545,7 @@
             }).join('');
 
             if (root) root.innerHTML = html;
-            if (preview) preview.innerHTML = html;
+            if (preview) preview.innerHTML = html.slice(0, 300) + (positions.length > 2 ? `<div class="text-center text-xs text-gray-500 mt-2">+ ${positions.length - 2} more</div>` : '');
         }
 
         async function loadDashboard() {
@@ -551,14 +555,34 @@
             document.getElementById('last-updated').textContent = now.toLocaleTimeString();
 
             try {
-                const [statsRes, tradesRes, healthRes] = await Promise.all([
+                const [statsRes, tradesRes, positionsRes, healthRes] = await Promise.all([
                     fetch(`${API_BASE}/stats`).catch(() => null),
                     fetch(`${API_BASE}/trades`).catch(() => null),
+                    fetch(`${API_BASE}/positions`).catch(() => null),
                     fetch(`${API_BASE}/health`).catch(() => null)
                 ]);
 
                 const statsData = statsRes ? await statsRes.json() : null;
                 const tradesData = tradesRes ? await tradesRes.json() : null;
+                const positionsData = positionsRes ? await positionsRes.json() : null;
+
+                // === UPDATE POSITIONS FROM DATABASE ===
+                if (positionsData && positionsData.status === 'success') {
+                    const positions = positionsData.data || [];
+                    allPositions = positions;
+                    renderPositionsFromDB(positions);
+                    // Update active count
+                    document.getElementById('active-count').textContent = positions.length;
+                } else {
+                    // Fallback: use trades data for OPEN positions
+                    if (tradesData && tradesData.status === 'success') {
+                        const trades = tradesData.data || [];
+                        const openFromTrades = trades.filter(t => t.status === 'OPEN');
+                        allPositions = openFromTrades;
+                        renderPositionsFromDB(openFromTrades);
+                        document.getElementById('active-count').textContent = openFromTrades.length;
+                    }
+                }
 
                 // === UPDATE HEALTH STATUS ===
                 if (healthRes && healthRes.ok) {
@@ -568,11 +592,9 @@
                         const statusEl = document.getElementById('health-status');
                         const healthError = document.getElementById('health-error');
                         
-                        // Update main health status
                         statusEl.textContent = h.status || 'Unknown';
                         statusEl.className = `text-sm font-semibold ${h.all_ok ? 'text-emerald-400' : 'text-amber-400'}`;
                         
-                        // Update individual health components
                         const components = ['broker', 'market', 'scanner', 'sync'];
                         const componentIds = ['health-broker', 'health-market', 'health-scanner', 'health-sync'];
                         
@@ -589,7 +611,6 @@
                             }
                         });
                         
-                        // Show/hide error
                         if (h.last_error) {
                             if (healthError) {
                                 healthError.textContent = `⚠️ ${h.last_error}`;
@@ -601,21 +622,10 @@
                             }
                         }
                         
-                        // Update error count
                         const errorCount = document.getElementById('error-count');
                         if (errorCount) {
                             errorCount.textContent = h.error_count || 0;
                         }
-                    }
-                } else {
-                    const statusEl = document.getElementById('health-status');
-                    const errorCount = document.getElementById('error-count');
-                    if (statusEl) {
-                        statusEl.textContent = '⚠️ Health unavailable';
-                        statusEl.className = 'text-sm font-semibold text-amber-400';
-                    }
-                    if (errorCount) {
-                        errorCount.textContent = '0';
                     }
                 }
 
@@ -625,6 +635,11 @@
                     document.getElementById('total-pnl').textContent = formatCurrency(s.overall?.total_pnl);
                     document.getElementById('total-trades').textContent = s.overall?.total_trades || 0;
                     document.getElementById('open-trades').textContent = s.overall?.open_trades || 0;
+                    
+                    // Use open_positions_count from stats if available
+                    if (s.open_positions_count !== undefined) {
+                        document.getElementById('active-positions-count').textContent = s.open_positions_count;
+                    }
                     
                     const closed = s.overall?.closed_trades || 0;
                     const won = s.overall?.winning_trades || 0;
@@ -664,11 +679,7 @@
                 if (tradesData && tradesData.status === 'success') {
                     const trades = tradesData.data || [];
                     allTrades = trades;
-                    const active = trades.filter(t => t.status === 'OPEN');
                     const closed = trades.filter(t => t.status === 'CLOSED');
-                    document.getElementById('active-count').textContent = active.length;
-                    document.getElementById('active-positions-count').textContent = active.length;
-                    renderPositions(active);
                     renderTrades(closed.slice(0, 20), 'all');
                 }
 
@@ -793,17 +804,14 @@
                     const isOpen = data.is_open;
                     document.getElementById('market-status').textContent = marketStatusText;
                     
-                    // Update status dot
                     const dot = document.getElementById('status-dot');
                     if (dot) dot.className = `status-dot ${isOpen ? 'green' : 'red'}`;
                     
-                    // Update scan status
                     const statusEl = document.getElementById('scan-status');
                     if (statusEl) {
                         statusEl.textContent = isOpen ? '🟢 Running' : marketStatusText;
                     }
                     
-                    // Update the Market health dot only, keep overall health from /health
                     const marketDot = document.getElementById('health-market');
                     if (marketDot) {
                         marketDot.className = `status-dot ${isOpen ? 'green' : 'red'}`;
@@ -822,7 +830,7 @@
         }
 
         refreshDashboard();
-        setInterval(refreshDashboard, 20000);
+        setInterval(refreshDashboard, 30000);
     </script>
 </body>
 </html>
