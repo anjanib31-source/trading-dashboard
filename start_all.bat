@@ -102,6 +102,28 @@ if defined NGROK_READY (
             
             :: Save to .env for dashboard
             echo NGROK_URL=%NGROK_URL% >> .env
+            
+            :: ========================================
+            :: UPDATE GITHUB WITH NEW NGROK URL
+            :: ========================================
+            echo.
+            echo 📤 Updating GitHub with new ngrok URL...
+            
+            :: Save URL to file in repo
+            echo %NGROK_URL% > ngrok_url.txt
+            
+            :: Check if git is available and repo is clean
+            git add ngrok_url.txt
+            git commit -m "🔄 Auto-update ngrok URL: %date% %time%"
+            git push origin main
+            
+            if !ERRORLEVEL! EQU 0 (
+                echo ✅ GitHub updated with new URL!
+                echo 📱 PWA will now use: %NGROK_URL%
+            ) else (
+                echo ⚠️ Could not update GitHub. PWA may use old URL.
+                echo    You can manually update ngrok_url.txt in GitHub.
+            )
         )
     )
 )

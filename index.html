@@ -1,1 +1,140 @@
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"><title>ALPHA BOT</title><meta http-equiv="refresh" content="0; url=https://turbine-bust-upload.ngrok-free.dev"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"></head><body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#0a0a0f;color:#34d399;font-family:sans-serif;"><div style="text-align:center;"><p style="font-size:48px;">�</p><p style="font-size:16px;">Loading your live dashboard...</p><p style="font-size:12px;color:#6b7280;margin-top:10px;">If you are not redirected, <a href="https://turbine-bust-upload.ngrok-free.dev" style="color:#34d399;">click here</a>.</p></div></body></html> 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ALPHA BOT</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: #0a0a0f;
+            color: #34d399;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            flex-direction: column;
+        }
+        .logo {
+            font-size: 48px;
+            font-weight: 300;
+            margin-bottom: 10px;
+        }
+        .loader {
+            width: 30px;
+            height: 30px;
+            border: 3px solid rgba(52, 211, 153, 0.1);
+            border-top-color: #34d399;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .status {
+            font-size: 14px;
+            color: #9ca3af;
+        }
+        .fallback {
+            font-size: 12px;
+            color: #6b7280;
+            margin-top: 15px;
+        }
+        .fallback a {
+            color: #34d399;
+            text-decoration: none;
+        }
+        .error {
+            color: #f43f5e;
+            font-size: 13px;
+            display: none;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="logo">α</div>
+    <div class="loader" id="loader"></div>
+    <div class="status" id="status">Connecting to your live dashboard...</div>
+    <div class="fallback" id="fallback">
+        If you are not redirected, <a href="#" id="fallback-link">click here</a>.
+    </div>
+    <div class="error" id="error">⚠️ Could not reach the live dashboard. Please check your bot is running.</div>
+
+    <script>
+        // The URL where your bot saves the latest ngrok address
+        const NGROK_URL_FILE = 'https://raw.githubusercontent.com/anjanib31-source/trading-dashboard/main/ngrok_url.txt';
+        // Fallback URL (update this if needed)
+        const FALLBACK_URL = 'https://turbine-bust-upload.ngrok-free.dev';
+        // Timeout after 8 seconds (in milliseconds)
+        const TIMEOUT_MS = 8000;
+
+        const statusEl = document.getElementById('status');
+        const loaderEl = document.getElementById('loader');
+        const fallbackLink = document.getElementById('fallback-link');
+        const errorEl = document.getElementById('error');
+
+        let redirectAttempted = false;
+
+        async function getLatestNgrokUrl() {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+                
+                const response = await fetch(NGROK_URL_FILE, {
+                    signal: controller.signal,
+                    cache: 'no-store' // Prevent caching
+                });
+                
+                clearTimeout(timeoutId);
+
+                if (response.ok) {
+                    const url = (await response.text()).trim();
+                    // Validate URL
+                    if (url.startsWith('https://') && url.includes('.ngrok-free.dev')) {
+                        return url;
+                    }
+                }
+            } catch (e) {
+                console.warn('Could not fetch latest ngrok URL:', e.message);
+            }
+            return FALLBACK_URL;
+        }
+
+        async function redirect() {
+            try {
+                statusEl.textContent = 'Fetching the latest dashboard address...';
+                
+                const liveUrl = await getLatestNgrokUrl();
+                
+                statusEl.textContent = 'Found! Redirecting you now...';
+                fallbackLink.href = liveUrl;
+                
+                // Give the user a moment to see the status, then redirect
+                setTimeout(() => {
+                    window.location.replace(liveUrl);
+                }, 300);
+                
+            } catch (e) {
+                console.error('Redirect error:', e);
+                loaderEl.style.display = 'none';
+                statusEl.textContent = '⚠️ Could not connect';
+                errorEl.style.display = 'block';
+            }
+        }
+
+        // Update the fallback link dynamically
+        (async function updateFallbackLink() {
+            const liveUrl = await getLatestNgrokUrl();
+            fallbackLink.href = liveUrl;
+        })();
+
+        // Start the redirect process
+        redirect();
+    </script>
+
+</body>
+</html>
