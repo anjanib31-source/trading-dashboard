@@ -22,16 +22,61 @@ The system is currently optimized for local operation from `start_all.bat` and f
 - Static HTML dashboard with Chart.js and Tailwind CDN.
 - Optional GitHub Pages dashboard sync from the bot-generated dashboard HTML.
 
+## New Features (v2.1)
+
+### PWA Dashboard with Auto-Redirect
+- Mobile-first PWA dashboard accessible via GitHub Pages
+- Automatically redirects to the latest ngrok URL
+- Auto-syncs ngrok URL to GitHub on each bot startup
+- Real-time data with auto-refresh every 30 seconds
+- Rate limit increased to 120 requests per minute for smoother browsing
+
+### Telegram Remote Control
+- 14 commands for remote monitoring and control
+- Commands work 24/7 (even when market is closed)
+- Multiple chat support for group notifications
+- Alert frequency control (60s cooldown)
+- Performance alerts for milestones (3 wins, 2 losses, ₹500 profit)
+
+### Enhanced Data Sources
+- **NSE Python** as primary data source (fast & free)
+- **Angel One API** as secondary
+- **Yahoo Finance** as fallback
+- Circuit breaker with auto-reset (10 failures, 30s timeout)
+
+### Smart Stock Selection
+- Dynamic universe of 500+ stocks (up from 29)
+- Market cap filter (> ₹500 Cr)
+- Sector momentum detection
+- 4-tier data source hierarchy for reliability
+
 ## Architecture
 
-The active system has two runtime processes:
+The active system has three runtime processes:
 
 1. `src/app.py` starts a Flask API server on port `5000`.
 2. `src/angel_bot_v2.py` starts the trading bot loop.
+3. `ngrok` creates a secure tunnel for external dashboard access.
 
-`start_all.bat` also starts `ngrok http 5000` so a public dashboard URL can reach the local Flask API.
+`start_all.bat` starts all three and automatically pushes the ngrok URL to GitHub for the PWA.
 
-The active architecture is monolithic inside `src/angel_bot_v2.py`. Most concerns are implemented in one `AngelTradingBot` class: auth, market data, scoring, risk, execution, persistence, dashboard generation, GitHub publishing, market calendar checks, and the main loop.
+### Data Source Hierarchy
+1. **NSE Python** (Primary - fast, free)
+2. **Angel One API** (Secondary)
+3. **Yahoo Finance** (Fallback)
+4. **Bulk Data Store** (Emergency)
+
+### Telegram Integration
+- Incoming commands processed by `TelegramBotHandler` class
+- Listener runs 24/7 in a background thread
+- 14 commands available for remote control
+- Multiple chat support via `TELEGRAM_CHAT_IDS`
+
+### PWA Dashboard
+- GitHub Pages serves `index.html` (smart redirector)
+- Redirects to current ngrok URL
+- Auto-updates when ngrok URL changes
+- Installed as PWA on mobile devices
 
 ## Folder Structure
 
@@ -68,17 +113,21 @@ flowchart TD
     A --> C[Start ngrok tunnel]
     A --> D[Start trading bot src/angel_bot_v2.py]
     D --> E[Load .env credentials]
-    D --> F[Check market status and trading day]
-    F --> G[Login to Angel SmartAPI]
-    G --> H[Load scrip_master.json symbol tokens]
-    H --> I[Build stock list]
-    I --> J[Start websocket]
-    J --> K[Loop: fetch data, score stocks, manage exits]
-    K --> L[Paper orders and in-memory positions]
-    L --> M[Save closed trades to trades.db]
-    B --> N[Serve web/dashboard.html and /api/*]
-    N --> O[Dashboard fetches stats from API]
-    M --> N
+    D --> F[Start Telegram listener]
+    F --> G[Check market status and trading day]
+    G --> H[Login to Angel SmartAPI]
+    H --> I[Load scrip_master.json symbol tokens]
+    I --> J[Build dynamic stock universe from NSE Python]
+    J --> K[Start websocket]
+    K --> L[Loop: fetch data, score stocks, manage exits]
+    L --> M[Paper orders and in-memory positions]
+    M --> N[Save closed trades to trades.db]
+    B --> O[Serve web/dashboard.html and /api/*]
+    O --> P[Dashboard fetches stats from API]
+    N --> O
+    C --> Q[ngrok saves URL to ngrok_url.txt]
+    Q --> R[Auto-push URL to GitHub]
+    R --> S[PWA redirects to latest URL]
 ```
 
 ## Assumptions
@@ -86,3 +135,35 @@ flowchart TD
 - `start_all.bat` is the canonical local startup path because it is the only launcher that starts both active Python processes.
 - `config/*.yaml` and `data/stock_config.json` are intended future configuration sources, but active code currently uses constants in `src/angel_bot_v2.py`.
 - `dashboard_backup.html` is runtime-generated and useful as an artifact, but it is not served by Flask unless manually opened or deployed.
+
+## Monitoring & Control
+
+### Telegram Commands
+| Command | Description |
+|---------|-------------|
+| `/status` | Show bot status |
+| `/health` | Health check |
+| `/positions` | Open positions |
+| `/trades` | Recent trades |
+| `/scan` | Force scan |
+| `/restart` | Restart bot |
+| `/stop` | Stop trading |
+| `/start` | Resume trading |
+| `/ws` | WebSocket status |
+| `/reconnect` | Reconnect WS |
+| `/ping` | Check if alive |
+| `/help` | Show commands |
+| `/logs` | Recent logs |
+| `/reset` | Reset circuit breaker |
+
+### Dashboard URLs
+| Access | URL |
+|--------|-----|
+| **Local** | `http://localhost:5000` |
+| **ngrok** | Auto-generated, saved to `ngrok_url.txt` |
+| **PWA** | `https://anjanib31-source.github.io/trading-dashboard/` |
+
+### Rate Limiting
+- API rate limit: 120 requests per minute
+- Telegram command cooldown: 5 seconds
+- Alert cooldown: 60 seconds
