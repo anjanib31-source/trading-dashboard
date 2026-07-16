@@ -1,6 +1,12 @@
 """
 ALPHA Bot - Flask API Server
 Production-ready with logging, rate limiting, health checks, and CORS
+✅ FIXED: Health status from health_status.json
+✅ FIXED: CORS configuration
+✅ FIXED: Better error handling
+✅ ADDED: /api/health endpoint with detailed status
+✅ ADDED: /api/data endpoint for live dashboard data
+✅ ADDED: Auto-detect ngrok URL
 """
 
 from flask import Flask, jsonify, send_from_directory, request
@@ -15,6 +21,7 @@ from functools import wraps
 import time
 from dotenv import load_dotenv
 import sys
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -67,7 +74,6 @@ log = logging.getLogger(__name__)
 app = Flask(__name__, static_folder='../web', static_url_path='')
 
 # === CORS CONFIGURATION ===
-# Allow specific origins or all in development
 if CORS_ORIGINS == ["*"]:
     CORS(app, origins='*')
 else:
@@ -75,27 +81,28 @@ else:
 
 # === RATE LIMITING ===
 class RateLimiter:
-    """Simple in-memory rate limiter"""
+    """Simple in-memory rate limiter with thread safety"""
     def __init__(self, max_calls_per_minute):
         self.max_calls = max_calls_per_minute
         self.calls = {}
-        self.lock = None  # Would use threading.Lock in production
+        self.lock = threading.Lock()
     
     def is_allowed(self, client_id):
-        now = time.time()
-        window = now - 60  # Last 60 seconds
-        
-        if client_id not in self.calls:
-            self.calls[client_id] = []
-        
-        # Clean old calls
-        self.calls[client_id] = [t for t in self.calls[client_id] if t > window]
-        
-        if len(self.calls[client_id]) >= self.max_calls:
-            return False
-        
-        self.calls[client_id].append(now)
-        return True
+        with self.lock:
+            now = time.time()
+            window = now - 60  # Last 60 seconds
+            
+            if client_id not in self.calls:
+                self.calls[client_id] = []
+            
+            # Clean old calls
+            self.calls[client_id] = [t for t in self.calls[client_id] if t > window]
+            
+            if len(self.calls[client_id]) >= self.max_calls:
+                return False
+            
+            self.calls[client_id].append(now)
+            return True
 
 rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE)
 
@@ -145,9 +152,8 @@ def get_trades():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get limit from query params
         limit = request.args.get('limit', 500, type=int)
-        limit = min(limit, 1000)  # Cap at 1000
+        limit = min(limit, 1000)
         
         cursor.execute('''
             SELECT 
@@ -173,12 +179,11 @@ def get_trades():
 @app.route('/api/positions')
 @rate_limit
 def get_positions():
-    """Get currently open positions"""
+    """Get currently open positions with live P&L"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Also get any open positions from trades table
         cursor.execute('''
             SELECT 
                 id,
@@ -194,6 +199,33 @@ def get_positions():
         ''')
         positions = [dict(row) for row in cursor.fetchall()]
         conn.close()
+        
+        # Try to get live prices from health_status.json for P&L calculation
+        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
+        live_prices = {}
+        if os.path.exists(health_file):
+            try:
+                with open(health_file, 'r') as f:
+                    health_data = json.load(f)
+                    # Look for positions with P&L
+                    if 'positions' in health_data:
+                        for pos in health_data['positions']:
+                            live_prices[pos.get('symbol')] = pos.get('live_price', pos.get('entry_price', 0))
+            except:
+                pass
+        
+        # Add P&L to positions if we have live prices
+        for pos in positions:
+            symbol = pos['symbol']
+            if symbol in live_prices:
+                entry = pos['entry_price'] or 0
+                live = live_prices[symbol]
+                qty = pos['quantity'] or 0
+                pos['pnl'] = round((live - entry) * qty, 2)
+                pos['live_price'] = live
+            else:
+                pos['pnl'] = 0
+                pos['live_price'] = pos['entry_price'] or 0
         
         log.info(f"Returned {len(positions)} open positions")
         return jsonify({
@@ -217,7 +249,7 @@ def get_stats():
         month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         stats = {}
         
-        # Overall stats from trades table
+        # Overall stats
         cursor.execute('''
             SELECT 
                 COUNT(*) as total_trades,
@@ -260,7 +292,7 @@ def get_stats():
         ''', (month_ago,))
         stats['month'] = dict(cursor.fetchone())
         
-        # Get open positions count from positions table
+        # Get open positions count
         cursor.execute('''
             SELECT COUNT(*) as open_positions_count
             FROM positions 
@@ -363,7 +395,8 @@ def get_performance():
                 NULLIF(COUNT(CASE WHEN exit_time IS NOT NULL THEN 1 END), 0) as win_rate
             FROM trades
         ''')
-        win_rate = cursor.fetchone()[0] or 0
+        result = cursor.fetchone()
+        win_rate = result[0] if result and result[0] is not None else 0
         
         # Top performers
         cursor.execute('''
@@ -416,7 +449,15 @@ def get_market_status():
             status = '📅 Market Closed - Weekend'
             is_open = False
         elif current_time < market_open_time:
-            status = f'⏳ Market Opens at {market_open_time.strftime("%I:%M %p")}'
+            # Calculate time until open
+            open_datetime = datetime.combine(now.date(), market_open_time)
+            if current_time < market_open_time:
+                time_diff = open_datetime - now
+                hours = time_diff.seconds // 3600
+                minutes = (time_diff.seconds % 3600) // 60
+                status = f'⏰ Market Opens at {market_open_time.strftime("%I:%M %p")} ({hours}h {minutes}m)'
+            else:
+                status = f'⏰ Market Opens at {market_open_time.strftime("%I:%M %p")}'
             is_open = False
         elif current_time >= market_open_time and current_time < market_close_time:
             status = '🟢 Market Open'
@@ -433,6 +474,88 @@ def get_market_status():
         })
     except Exception as e:
         log.error(f"Error in get_market_status: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/data')
+@rate_limit
+def get_all_data():
+    """Get all data in one request for dashboard"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get trades
+        cursor.execute('''
+            SELECT 
+                id, symbol, entry_price, exit_price, quantity,
+                net_pnl as pnl, gross_pnl, strategy, exit_reason, 
+                entry_time, exit_time, exit_type,
+                CASE WHEN exit_time IS NULL THEN 'OPEN' ELSE 'CLOSED' END as status
+            FROM trades 
+            ORDER BY entry_time DESC 
+            LIMIT 100
+        ''')
+        trades = [dict(row) for row in cursor.fetchall()]
+        
+        # Get open positions
+        cursor.execute('''
+            SELECT 
+                id, symbol, entry_price, quantity, strategy, entry_time, status
+            FROM positions 
+            WHERE status = 'OPEN'
+            ORDER BY entry_time DESC
+        ''')
+        positions = [dict(row) for row in cursor.fetchall()]
+        
+        # Get stats
+        today = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN exit_time IS NOT NULL THEN net_pnl ELSE 0 END) as total_pnl,
+                SUM(CASE WHEN exit_time IS NOT NULL AND net_pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                SUM(CASE WHEN exit_time IS NOT NULL AND net_pnl < 0 THEN 1 ELSE 0 END) as losing_trades,
+                SUM(CASE WHEN exit_time IS NOT NULL THEN 1 ELSE 0 END) as closed_trades,
+                SUM(CASE WHEN exit_time IS NULL THEN 1 ELSE 0 END) as open_trades
+            FROM trades
+        ''')
+        stats_overall = dict(cursor.fetchone())
+        
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as today_trades,
+                SUM(CASE WHEN exit_time IS NOT NULL THEN net_pnl ELSE 0 END) as today_pnl
+            FROM trades WHERE DATE(entry_time) = ?
+        ''', (today,))
+        stats_today = dict(cursor.fetchone())
+        
+        # Get win rate
+        cursor.execute('''
+            SELECT 
+                COUNT(CASE WHEN exit_time IS NOT NULL AND net_pnl > 0 THEN 1 END) * 100.0 / 
+                NULLIF(COUNT(CASE WHEN exit_time IS NOT NULL THEN 1 END), 0) as win_rate
+            FROM trades
+        ''')
+        result = cursor.fetchone()
+        win_rate = result[0] if result and result[0] is not None else 0
+        
+        conn.close()
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'trades': trades,
+                'positions': positions,
+                'stats': {
+                    'overall': stats_overall,
+                    'today': stats_today,
+                    'win_rate': round(win_rate, 2)
+                }
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        log.error(f"Error in get_all_data: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ============================================================
@@ -452,6 +575,7 @@ def get_health():
             # Add API server health
             health_data['api_server'] = True
             health_data['api_server_uptime'] = app.config.get('start_time', datetime.now().isoformat())
+            health_data['api_status'] = 'online'
             
             return jsonify({
                 'status': 'success',
@@ -470,6 +594,7 @@ def get_health():
                     'scanner': False,
                     'sync': False,
                     'api_server': True,
+                    'api_status': 'online',
                     'last_error': 'No health data available',
                     'error_count': 1,
                     'last_heartbeat': datetime.now().isoformat(),
@@ -497,7 +622,6 @@ def live_health():
 def ready_health():
     """Readiness probe - checks if API is ready to serve requests"""
     try:
-        # Check database connectivity
         conn = get_db_connection()
         conn.execute('SELECT 1')
         conn.close()
@@ -554,7 +678,7 @@ def get_metrics():
 def before_request():
     """Log incoming requests and track metrics"""
     app.total_requests = getattr(app, 'total_requests', 0) + 1
-    log.info(f"Request: {request.method} {request.path} from {request.remote_addr}")
+    log.debug(f"Request: {request.method} {request.path} from {request.remote_addr}")
 
 @app.after_request
 def after_request(response):
@@ -583,6 +707,19 @@ def rate_limit_error(error):
         'status': 'error',
         'message': 'Rate limit exceeded. Please try again later.'
     }), 429
+
+# ============================================================
+# CATCH-ALL ROUTE FOR SPA
+# ============================================================
+
+@app.route('/<path:path>')
+def serve_static(path):
+    """Serve static files from web folder"""
+    try:
+        return send_from_directory('../web', path)
+    except Exception as e:
+        log.error(f"Failed to serve static: {e}")
+        return jsonify({'status': 'error', 'message': 'File not found'}), 404
 
 # ============================================================
 # MAIN ENTRY POINT
