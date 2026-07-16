@@ -1,12 +1,9 @@
 """
 ALPHA Bot - Flask API Server
 Production-ready with logging, rate limiting, health checks, and CORS
-✅ FIXED: Health status from health_status.json
-✅ FIXED: CORS configuration
+✅ FIXED: Increased rate limit to 120 requests/min
 ✅ FIXED: Better error handling
-✅ ADDED: /api/health endpoint with detailed status
-✅ ADDED: /api/data endpoint for live dashboard data
-✅ ADDED: Auto-detect ngrok URL
+✅ ADDED: /api/data endpoint for consolidated dashboard data
 """
 
 from flask import Flask, jsonify, send_from_directory, request
@@ -29,7 +26,7 @@ load_dotenv()
 # === CONFIGURATION ===
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), 'trades.db'))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))  # Increased from 60 to 120
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 PORT = int(os.getenv("PORT", 5000))
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -115,7 +112,7 @@ def rate_limit(f):
             log.warning(f"Rate limit exceeded for {client_id}")
             return jsonify({
                 'status': 'error',
-                'message': 'Rate limit exceeded. Please try again later.'
+                'message': 'Rate limit exceeded. Please wait a moment and try again.'
             }), 429
         return f(*args, **kwargs)
     return decorated_function
@@ -207,7 +204,6 @@ def get_positions():
             try:
                 with open(health_file, 'r') as f:
                     health_data = json.load(f)
-                    # Look for positions with P&L
                     if 'positions' in health_data:
                         for pos in health_data['positions']:
                             live_prices[pos.get('symbol')] = pos.get('live_price', pos.get('entry_price', 0))
@@ -449,7 +445,6 @@ def get_market_status():
             status = '📅 Market Closed - Weekend'
             is_open = False
         elif current_time < market_open_time:
-            # Calculate time until open
             open_datetime = datetime.combine(now.date(), market_open_time)
             if current_time < market_open_time:
                 time_diff = open_datetime - now
@@ -474,6 +469,107 @@ def get_market_status():
         })
     except Exception as e:
         log.error(f"Error in get_market_status: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/health')
+@rate_limit
+def get_health():
+    """Get bot health status from health_status.json file"""
+    try:
+        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
+        if os.path.exists(health_file):
+            with open(health_file, 'r') as f:
+                health_data = json.load(f)
+            
+            health_data['api_server'] = True
+            health_data['api_server_uptime'] = app.config.get('start_time', datetime.now().isoformat())
+            health_data['api_status'] = 'online'
+            
+            return jsonify({
+                'status': 'success',
+                'data': health_data,
+                'timestamp': datetime.now().isoformat()
+            })
+        else:
+            return jsonify({
+                'status': 'success',
+                'data': {
+                    'status': '⚠️ Bot not running',
+                    'all_ok': False,
+                    'broker': False,
+                    'market': False,
+                    'scanner': False,
+                    'sync': False,
+                    'api_server': True,
+                    'api_status': 'online',
+                    'last_error': 'No health data available',
+                    'error_count': 1,
+                    'last_heartbeat': datetime.now().isoformat(),
+                    'bot_running': False,
+                    'start_time': datetime.now().isoformat()
+                },
+                'timestamp': datetime.now().isoformat()
+            })
+    except Exception as e:
+        log.error(f"Error in get_health: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/health/live')
+def live_health():
+    """Simple liveness probe for container orchestration"""
+    return jsonify({
+        'status': 'alive',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/api/health/ready')
+def ready_health():
+    """Readiness probe - checks if API is ready to serve requests"""
+    try:
+        conn = get_db_connection()
+        conn.execute('SELECT 1')
+        conn.close()
+        
+        return jsonify({
+            'status': 'ready',
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        log.error(f"Ready check failed: {e}")
+        return jsonify({
+            'status': 'not_ready',
+            'reason': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 503
+
+@app.route('/api/metrics')
+@rate_limit
+def get_metrics():
+    """Get system metrics"""
+    try:
+        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
+        metrics = {}
+        
+        if os.path.exists(health_file):
+            with open(health_file, 'r') as f:
+                health_data = json.load(f)
+                metrics = health_data.get('metrics', {})
+        
+        metrics['api_requests'] = {
+            'total': getattr(app, 'total_requests', 0),
+            'errors': getattr(app, 'error_requests', 0)
+        }
+        
+        return jsonify({
+            'status': 'success',
+            'data': metrics,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        log.error(f"Error in get_metrics: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/data')
@@ -558,122 +654,6 @@ def get_all_data():
         log.error(f"Error in get_all_data: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ============================================================
-# HEALTH CHECK ENDPOINTS
-# ============================================================
-
-@app.route('/api/health')
-@rate_limit
-def get_health():
-    """Get bot health status from health_status.json file"""
-    try:
-        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
-        if os.path.exists(health_file):
-            with open(health_file, 'r') as f:
-                health_data = json.load(f)
-            
-            # Add API server health
-            health_data['api_server'] = True
-            health_data['api_server_uptime'] = app.config.get('start_time', datetime.now().isoformat())
-            health_data['api_status'] = 'online'
-            
-            return jsonify({
-                'status': 'success',
-                'data': health_data,
-                'timestamp': datetime.now().isoformat()
-            })
-        else:
-            # Return default health if no data
-            return jsonify({
-                'status': 'success',
-                'data': {
-                    'status': '⚠️ Bot not running',
-                    'all_ok': False,
-                    'broker': False,
-                    'market': False,
-                    'scanner': False,
-                    'sync': False,
-                    'api_server': True,
-                    'api_status': 'online',
-                    'last_error': 'No health data available',
-                    'error_count': 1,
-                    'last_heartbeat': datetime.now().isoformat(),
-                    'bot_running': False,
-                    'start_time': datetime.now().isoformat()
-                },
-                'timestamp': datetime.now().isoformat()
-            })
-    except Exception as e:
-        log.error(f"Error in get_health: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-@app.route('/api/health/live')
-def live_health():
-    """Simple liveness probe for container orchestration"""
-    return jsonify({
-        'status': 'alive',
-        'timestamp': datetime.now().isoformat()
-    })
-
-@app.route('/api/health/ready')
-def ready_health():
-    """Readiness probe - checks if API is ready to serve requests"""
-    try:
-        conn = get_db_connection()
-        conn.execute('SELECT 1')
-        conn.close()
-        
-        return jsonify({
-            'status': 'ready',
-            'timestamp': datetime.now().isoformat()
-        })
-    except Exception as e:
-        log.error(f"Ready check failed: {e}")
-        return jsonify({
-            'status': 'not_ready',
-            'reason': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 503
-
-# ============================================================
-# METRICS ENDPOINT (for monitoring)
-# ============================================================
-
-@app.route('/api/metrics')
-@rate_limit
-def get_metrics():
-    """Get system metrics"""
-    try:
-        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
-        metrics = {}
-        
-        if os.path.exists(health_file):
-            with open(health_file, 'r') as f:
-                health_data = json.load(f)
-                metrics = health_data.get('metrics', {})
-        
-        # Add API server metrics
-        metrics['api_requests'] = {
-            'total': getattr(app, 'total_requests', 0),
-            'errors': getattr(app, 'error_requests', 0)
-        }
-        
-        return jsonify({
-            'status': 'success',
-            'data': metrics,
-            'timestamp': datetime.now().isoformat()
-        })
-    except Exception as e:
-        log.error(f"Error in get_metrics: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-# ============================================================
-# REQUEST LOGGING MIDDLEWARE
-# ============================================================
-
 @app.before_request
 def before_request():
     """Log incoming requests and track metrics"""
@@ -688,10 +668,6 @@ def after_request(response):
         log.warning(f"Error response: {response.status_code} for {request.path}")
     return response
 
-# ============================================================
-# ERROR HANDLERS
-# ============================================================
-
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
@@ -705,12 +681,8 @@ def internal_error(error):
 def rate_limit_error(error):
     return jsonify({
         'status': 'error',
-        'message': 'Rate limit exceeded. Please try again later.'
+        'message': 'Rate limit exceeded. Please wait a moment and try again.'
     }), 429
-
-# ============================================================
-# CATCH-ALL ROUTE FOR SPA
-# ============================================================
 
 @app.route('/<path:path>')
 def serve_static(path):
@@ -721,12 +693,7 @@ def serve_static(path):
         log.error(f"Failed to serve static: {e}")
         return jsonify({'status': 'error', 'message': 'File not found'}), 404
 
-# ============================================================
-# MAIN ENTRY POINT
-# ============================================================
-
 if __name__ == '__main__':
-    # Store start time
     app.config['start_time'] = datetime.now().isoformat()
     
     log.info("=" * 60)
