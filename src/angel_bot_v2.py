@@ -2919,7 +2919,7 @@ class AngelTradingBot:
     # ============================================================
 
     def _perform_scan(self):
-        """Internal method to perform the actual scan"""
+        """Internal method to perform the actual scan - ONE BEST SIGNAL PER SCAN"""
         if not self.is_trading_time():
             self.scan_status = "⏰ Outside trading hours"
             return
@@ -2968,7 +2968,39 @@ class AngelTradingBot:
             self.scan_status = f"❌ No signals (Scored: {scored_count})"
             return
         
+        # ============================================================
+        # FIX: Only take the SINGLE BEST signal per scan
+        # ============================================================
         signals.sort(key=lambda x: x[1], reverse=True)
+        
+        # If tie in score, pick the one with higher volume (check LTP)
+        if len(signals) > 1 and signals[0][1] == signals[1][1]:
+            log.info(f"[SCAN] Tie in scores. Taking first signal: {signals[0][0]}")
+        
+        # Only process the top 1 signal per scan
+        best_signal = signals[0]
+        symbol, score, direction, strategy = best_signal
+        
+        # Check if we can open this position
+        if len(self.positions) >= MAX_POSITIONS:
+            log.info(f"[SCAN] Max positions ({MAX_POSITIONS}) reached, skipping top signal")
+            self.scan_status = f"⏸️ Max positions ({MAX_POSITIONS}) reached"
+            return
+        
+        current_price = self.get_ltp(symbol)
+        if not current_price:
+            log.warning(f"[SCAN] No price for {symbol}")
+            return
+        
+        if not self.check_correlation(symbol):
+            return
+        
+        if not self.check_sector_exposure(symbol):
+            return
+        
+        dynamic_sl = self.get_dynamic_stop_loss(symbol, current_price)
+        volatility_sl = self.get_volatility_stop(symbol, current_price)
+        final_sl = max(dynamic_sl, volatility_sl)
         
         def get_position_allocation(score):
             if score >= 10: return 0.45
@@ -2976,83 +3008,65 @@ class AngelTradingBot:
             elif score >= 8: return 0.25
             elif score >= 7: return 0.15
             else: return 0.00
-                    
-        for symbol, score, direction, strategy in signals:
-            if len(self.positions) >= MAX_POSITIONS:
-                break
-                
-            current_price = self.get_ltp(symbol)
-            if not current_price:
-                log.warning(f"[SCAN] No price for {symbol}")
-                continue
+        
+        allocation_pct = get_position_allocation(score)
+        # FIXED: Added LEVERAGE to position sizing
+        allocation_amount = (self.capital * LEVERAGE) * allocation_pct
+        qty = int(allocation_amount / current_price)
+        
+        if qty <= 0:
+            log.warning(f"[SCAN] Qty 0 for {symbol}, skipping")
+            return
             
-            if not self.check_correlation(symbol):
-                continue
+        margin = (current_price * qty) / LEVERAGE
+        
+        with self.lock:
+            if margin > self.available_capital:
+                log.warning(f"[MARGIN] Skipped {symbol}: Need ₹{margin:.2f}, Have ₹{self.available_capital:.2f}")
+                return
+                
+            log.info(f"💥 [SIGNAL] {symbol} | Score: {score} | Strategy: {strategy}")
+            log.info(f"[ALLOCATION] {allocation_pct*100:.1f}% of ₹{self.capital * LEVERAGE:,.2f} = ₹{allocation_amount:,.2f}")
+            log.info(f"[RISK] SL: {final_sl*100:.2f}% | Margin: ₹{margin:.2f}")
             
-            if not self.check_sector_exposure(symbol):
-                continue
+            profit_target = PROFIT_TARGETS.get(score, DEFAULT_PROFIT_TARGET)
+            target_price = current_price * (1 + profit_target)
+            stop_price = current_price * (1 - final_sl)
             
-            dynamic_sl = self.get_dynamic_stop_loss(symbol, current_price)
-            volatility_sl = self.get_volatility_stop(symbol, current_price)
-            final_sl = max(dynamic_sl, volatility_sl)
+            self.place_order(symbol, "BUY", qty, current_price)
             
-            allocation_pct = get_position_allocation(score)
-            # FIXED: Added LEVERAGE to position sizing
-            allocation_amount = (self.capital * LEVERAGE) * allocation_pct
-            qty = int(allocation_amount / current_price)
+            # Save to database immediately
+            self.save_position_to_db({
+                'symbol': symbol,
+                'entry_price': current_price,
+                'quantity': qty,
+                'strategy': strategy,
+                'entry_time': datetime.now().isoformat()
+            })
             
-            if qty <= 0:
-                continue
-                
-            margin = (current_price * qty) / LEVERAGE
+            self.positions.append({
+                'symbol': symbol, 'entry_price': current_price, 'peak_price': current_price,
+                'quantity': qty, 'remaining_qty': qty, 'entry_time': datetime.now(),
+                'score': score, 'profit_target': profit_target, 'strategy': strategy,
+                'stop_loss': final_sl, 'target_price': target_price, 'stop_price': stop_price,
+                'partial_exit_done': False, 'partial_exit_1_done': False,
+                'partial_exit_2_done': False, 'partial_exit_3_done': False
+            })
             
-            with self.lock:
-                if margin > self.available_capital:
-                    log.warning(f"[MARGIN] Skipped {symbol}: Need ₹{margin:.2f}, Have ₹{self.available_capital:.2f}")
-                    continue
-                    
-                log.info(f"💥 [SIGNAL] {symbol} | Score: {score} | Strategy: {strategy}")
-                log.info(f"[ALLOCATION] {allocation_pct*100:.1f}% of ₹{self.capital * LEVERAGE:,.2f} = ₹{allocation_amount:,.2f}")
-                log.info(f"[RISK] SL: {final_sl*100:.2f}% | Margin: ₹{margin:.2f}")
-                
-                profit_target = PROFIT_TARGETS.get(score, DEFAULT_PROFIT_TARGET)
-                target_price = current_price * (1 + profit_target)
-                stop_price = current_price * (1 - final_sl)
-                
-                self.place_order(symbol, "BUY", qty, current_price)
-                
-                # Save to database immediately
-                self.save_position_to_db({
-                    'symbol': symbol,
-                    'entry_price': current_price,
-                    'quantity': qty,
-                    'strategy': strategy,
-                    'entry_time': datetime.now().isoformat()
-                })
-                
-                self.positions.append({
-                    'symbol': symbol, 'entry_price': current_price, 'peak_price': current_price,
-                    'quantity': qty, 'remaining_qty': qty, 'entry_time': datetime.now(),
-                    'score': score, 'profit_target': profit_target, 'strategy': strategy,
-                    'stop_loss': final_sl, 'target_price': target_price, 'stop_price': stop_price,
-                    'partial_exit_done': False, 'partial_exit_1_done': False,
-                    'partial_exit_2_done': False, 'partial_exit_3_done': False
-                })
-                
-                self.scan_status = f"✅ Position opened: {symbol} (Score: {score})"
-                self.metrics.record_trade(success=True)
-                
-                # === ENHANCED TELEGRAM ALERT ON POSITION OPEN ===
-                send_trade_alert(
-                    symbol=symbol,
-                    entry_price=current_price,
-                    quantity=qty,
-                    score=score,
-                    strategy=strategy,
-                    target_price=target_price,
-                    stop_price=stop_price,
-                    alert_type="OPEN"
-                )
+            self.scan_status = f"✅ Position opened: {symbol} (Score: {score})"
+            self.metrics.record_trade(success=True)
+            
+            # === ENHANCED TELEGRAM ALERT ON POSITION OPEN ===
+            send_trade_alert(
+                symbol=symbol,
+                entry_price=current_price,
+                quantity=qty,
+                score=score,
+                strategy=strategy,
+                target_price=target_price,
+                stop_price=stop_price,
+                alert_type="OPEN"
+            )
 
     def scan_and_trade(self):
         """Wrapper for scan operation with overlap prevention"""
