@@ -5,136 +5,324 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>ALPHA BOT</title>
     <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0f;
+            color: #e8eaed;
+            min-height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: #0a0a0f;
-            color: #34d399;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            flex-direction: column;
+            padding: 20px;
+        }
+        .container {
+            max-width: 420px;
+            width: 100%;
+            text-align: center;
         }
         .logo {
             font-size: 48px;
             font-weight: 300;
-            margin-bottom: 10px;
+            color: #34d399;
+            margin-bottom: 8px;
         }
-        .loader {
-            width: 30px;
-            height: 30px;
-            border: 3px solid rgba(52, 211, 153, 0.1);
-            border-top-color: #34d399;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            margin: 20px auto;
+        .title {
+            font-size: 20px;
+            font-weight: 700;
+            color: #fff;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
         }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        .status {
-            font-size: 14px;
-            color: #9ca3af;
-        }
-        .fallback {
+        .subtitle {
             font-size: 12px;
             color: #6b7280;
-            margin-top: 15px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            margin-bottom: 30px;
         }
-        .fallback a {
-            color: #34d399;
+        .status-card {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 16px;
+            padding: 30px 20px;
+            margin-bottom: 20px;
+        }
+        .status-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+        }
+        .status-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .status-desc {
+            font-size: 14px;
+            color: #9ca3af;
+            line-height: 1.6;
+        }
+        .status-detail {
+            font-size: 12px;
+            color: #6b7280;
+            margin-top: 12px;
+            padding: 10px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            font-family: monospace;
+        }
+        .btn {
+            display: inline-block;
+            padding: 12px 32px;
+            background: #34d399;
+            color: #0a0a0f;
+            font-weight: 600;
+            border-radius: 12px;
             text-decoration: none;
-        }
-        .error {
-            color: #f43f5e;
-            font-size: 13px;
-            display: none;
+            font-size: 14px;
             margin-top: 10px;
+            border: none;
+            cursor: pointer;
         }
+        .btn:hover { background: #6ee7b7; }
+        .btn-secondary {
+            background: rgba(255,255,255,0.08);
+            color: #e8eaed;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .btn-secondary:hover { background: rgba(255,255,255,0.15); }
+        .footer {
+            font-size: 10px;
+            color: #4b5563;
+            margin-top: 20px;
+        }
+        .hidden { display: none !important; }
+        .retry-btn { margin-top: 16px; }
     </style>
 </head>
 <body>
 
+<div class="container" id="app">
     <div class="logo">α</div>
-    <div class="loader" id="loader"></div>
-    <div class="status" id="status">Connecting to your live dashboard...</div>
-    <div class="fallback" id="fallback">
-        If you are not redirected, <a href="#" id="fallback-link">click here</a>.
+    <div class="title">ALPHA BOT</div>
+    <div class="subtitle">Operations Console</div>
+
+    <!-- ===== STATUS: STARTING ===== -->
+    <div class="status-card" id="status-starting">
+        <div class="status-icon">🔄</div>
+        <div class="status-title" style="color:#fbbf24;">Connecting...</div>
+        <div class="status-desc">Establishing secure connection to your trading bot...</div>
+        <div class="status-detail" id="start-detail">⏳ Please wait a moment</div>
     </div>
-    <div class="error" id="error">⚠️ Could not reach the live dashboard. Please check your bot is running.</div>
 
-    <script>
-        // The URL where your bot saves the latest ngrok address
-        const NGROK_URL_FILE = 'https://raw.githubusercontent.com/anjanib31-source/trading-dashboard/main/ngrok_url.txt';
-        // Fallback URL (update this if needed)
-        const FALLBACK_URL = 'https://turbine-bust-upload.ngrok-free.dev';
-        // Timeout after 8 seconds (in milliseconds)
-        const TIMEOUT_MS = 8000;
+    <!-- ===== STATUS: OFFLINE ===== -->
+    <div class="status-card hidden" id="status-offline">
+        <div class="status-icon">😴</div>
+        <div class="status-title" style="color:#6b7280;">Bot is Sleeping</div>
+        <div class="status-desc">Your trading bot is currently offline.</div>
+        <div class="status-detail" style="color:#6b7280;">
+            💡 To wake up the bot:<br>
+            1️⃣ Start your laptop<br>
+            2️⃣ Run <strong style="color:#e8eaed;">start_all.bat</strong><br>
+            3️⃣ Wait 30 seconds<br>
+            4️⃣ Refresh this page
+        </div>
+        <button class="btn btn-secondary retry-btn" onclick="checkConnection()">🔄 Retry Connection</button>
+    </div>
 
-        const statusEl = document.getElementById('status');
-        const loaderEl = document.getElementById('loader');
-        const fallbackLink = document.getElementById('fallback-link');
-        const errorEl = document.getElementById('error');
+    <!-- ===== STATUS: MARKET CLOSED ===== -->
+    <div class="status-card hidden" id="status-market-closed">
+        <div class="status-icon">🏛️</div>
+        <div class="status-title" style="color:#fbbf24;">Market is Closed</div>
+        <div class="status-desc">The bot is sleeping and will wake up when the market opens.</div>
+        <div class="status-detail" id="market-detail">⏰ Next open: 09:15 AM</div>
+    </div>
 
-        let redirectAttempted = false;
+    <!-- ===== STATUS: ERROR ===== -->
+    <div class="status-card hidden" id="status-error">
+        <div class="status-icon">⚠️</div>
+        <div class="status-title" style="color:#f43f5e;">Connection Failed</div>
+        <div class="status-desc">Could not reach the trading bot.</div>
+        <div class="status-detail" id="error-detail">Please check your connection and try again.</div>
+        <button class="btn btn-secondary retry-btn" onclick="checkConnection()">🔄 Try Again</button>
+    </div>
 
-        async function getLatestNgrokUrl() {
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
-                
-                const response = await fetch(NGROK_URL_FILE, {
-                    signal: controller.signal,
-                    cache: 'no-store' // Prevent caching
-                });
-                
-                clearTimeout(timeoutId);
+    <div class="footer">
+        <span id="timestamp"></span> · <span id="retry-count">Attempt 1</span>
+    </div>
+</div>
 
-                if (response.ok) {
-                    const url = (await response.text()).trim();
-                    // Validate URL
-                    if (url.startsWith('https://') && url.includes('.ngrok-free.dev')) {
-                        return url;
-                    }
-                }
-            } catch (e) {
-                console.warn('Could not fetch latest ngrok URL:', e.message);
+<script>
+    // ============================================================
+    // CONFIGURATION
+    // ============================================================
+    const NGROK_URL_FILE = 'https://raw.githubusercontent.com/anjanib31-source/trading-dashboard/main/ngrok_url.txt';
+    const TIMEOUT_MS = 8000;
+    const MAX_RETRIES = 3;
+
+    let retryCount = 0;
+    let statusInterval = null;
+
+    // ============================================================
+    // DOM REFS
+    // ============================================================
+    const statuses = {
+        starting: document.getElementById('status-starting'),
+        offline: document.getElementById('status-offline'),
+        marketClosed: document.getElementById('status-market-closed'),
+        error: document.getElementById('status-error'),
+    };
+    const startDetail = document.getElementById('start-detail');
+    const marketDetail = document.getElementById('market-detail');
+    const errorDetail = document.getElementById('error-detail');
+    const timestampEl = document.getElementById('timestamp');
+    const retryCountEl = document.getElementById('retry-count');
+
+    // ============================================================
+    // HELPERS
+    // ============================================================
+    function showStatus(statusId) {
+        Object.keys(statuses).forEach(key => {
+            statuses[key].classList.add('hidden');
+        });
+        statuses[statusId].classList.remove('hidden');
+    }
+
+    function updateTimestamp() {
+        const now = new Date();
+        timestampEl.textContent = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function updateRetryCount() {
+        retryCountEl.textContent = `Attempt ${retryCount}`;
+    }
+
+    // ============================================================
+    // CHECK CONNECTION
+    // ============================================================
+    async function checkConnection() {
+        retryCount++;
+        updateRetryCount();
+        showStatus('starting');
+        startDetail.textContent = '⏳ Attempting to connect...';
+
+        try {
+            // Step 1: Get latest ngrok URL
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+            const response = await fetch(NGROK_URL_FILE, {
+                signal: controller.signal,
+                cache: 'no-store'
+            });
+
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+                throw new Error('Could not fetch ngrok URL');
             }
-            return FALLBACK_URL;
-        }
 
-        async function redirect() {
-            try {
-                statusEl.textContent = 'Fetching the latest dashboard address...';
-                
-                const liveUrl = await getLatestNgrokUrl();
-                
-                statusEl.textContent = 'Found! Redirecting you now...';
-                fallbackLink.href = liveUrl;
-                
-                // Give the user a moment to see the status, then redirect
+            let ngrokUrl = (await response.text()).trim();
+
+            if (!ngrokUrl.startsWith('https://') || !ngrokUrl.includes('.ngrok-free.dev')) {
+                throw new Error('Invalid ngrok URL');
+            }
+
+            // Step 2: Try to connect to the API
+            startDetail.textContent = '🔗 Connecting to the bot...';
+
+            const healthResponse = await fetch(`${ngrokUrl}/api/health`, {
+                signal: controller.signal,
+                cache: 'no-store',
+                timeout: 5000
+            });
+
+            if (!healthResponse.ok) {
+                throw new Error('API not responding');
+            }
+
+            const healthData = await healthResponse.json();
+
+            // Step 3: Check market status from health data
+            const isMarketOpen = healthData?.data?.market || false;
+            const statusText = healthData?.data?.status || '';
+
+            // Step 4: If connected, redirect to the live dashboard
+            window.location.replace(ngrokUrl);
+
+        } catch (error) {
+            console.warn('Connection check failed:', error.message);
+
+            // Show appropriate error based on the error type
+            if (error.message.includes('fetch') || error.message.includes('network')) {
+                showStatus('offline');
+            } else if (error.message.includes('timeout')) {
+                showStatus('error');
+                errorDetail.textContent = '⏱️ Connection timed out. The bot might be starting up. Please wait 30 seconds and try again.';
+            } else {
+                showStatus('error');
+                errorDetail.textContent = `⚠️ ${error.message}`;
+            }
+
+            // If we haven't exceeded retries, try again automatically
+            if (retryCount < MAX_RETRIES) {
+                startDetail.textContent = `⏳ Retry ${retryCount}/${MAX_RETRIES} in 5 seconds...`;
+                setTimeout(checkConnection, 5000);
+            } else {
+                // Show offline status after max retries
+                showStatus('offline');
+            }
+        }
+    }
+
+    // ============================================================
+    // AUTOMATIC REFRESH
+    // ============================================================
+    function autoRefresh() {
+        updateTimestamp();
+        updateRetryCount();
+
+        // If we're showing the offline or error status, try to reconnect
+        const showingOffline = !statuses.offline.classList.contains('hidden');
+        const showingError = !statuses.error.classList.contains('hidden');
+
+        if (showingOffline || showingError) {
+            // Wait a bit before retrying (longer cooldown)
+            if (retryCount > MAX_RETRIES) {
+                // After max retries, wait 60 seconds before retrying
+                if (statusInterval) clearInterval(statusInterval);
                 setTimeout(() => {
-                    window.location.replace(liveUrl);
-                }, 300);
-                
-            } catch (e) {
-                console.error('Redirect error:', e);
-                loaderEl.style.display = 'none';
-                statusEl.textContent = '⚠️ Could not connect';
-                errorEl.style.display = 'block';
+                    retryCount = 0;
+                    checkConnection();
+                    statusInterval = setInterval(autoRefresh, 30000);
+                }, 60000);
+                return;
             }
         }
+    }
 
-        // Update the fallback link dynamically
-        (async function updateFallbackLink() {
-            const liveUrl = await getLatestNgrokUrl();
-            fallbackLink.href = liveUrl;
-        })();
+    // ============================================================
+    // INITIALIZATION
+    // ============================================================
+    function init() {
+        updateTimestamp();
+        updateRetryCount();
+        showStatus('starting');
+        startDetail.textContent = '⏳ Initializing connection...';
 
-        // Start the redirect process
-        redirect();
-    </script>
+        // Start connection check
+        checkConnection();
 
+        // Auto-refresh every 30 seconds
+        statusInterval = setInterval(autoRefresh, 30000);
+    }
+
+    // Start when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+</script>
 </body>
 </html>
