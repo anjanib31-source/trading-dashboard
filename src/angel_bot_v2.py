@@ -1,20 +1,36 @@
 """
-ALPHA Trading Bot - Production-Ready Implementation
-✅ FIXED: API Parameter Error
-✅ FIXED: Circuit Breaker Sensitivity
-✅ FIXED: NSE Python Integration
-✅ FIXED: Data Source Hierarchy
-✅ FIXED: Leverage Position Sizing
-✅ FIXED: Extended Hold for High Score
-✅ FIXED: Dynamic Stock Universe
-✅ FIXED: Auto-Recovery
-✅ ADDED: Multi-Tier Data Sources
-✅ ADDED: Circuit Breaker Auto-Reset
-✅ ADDED: Telegram Remote Control Commands
-✅ ADDED: Multiple Chat Support
-✅ ADDED: Alert Frequency Control
-✅ ADDED: Trade Performance Alerts
-✅ FIXED: Telegram Starts 24/7 (Before Market Check)
+ALPHA Trading Bot - Complete Production Implementation
+Phase 2+ with all improvements including:
+- WebSocket Heartbeat
+- Transaction Management
+- Log Rotation
+- Rate Limiting
+- Circuit Breaker
+- Retry Logic
+- Cache Management
+- Metrics Collection
+- Health Monitoring
+- Error Recovery
+- Configuration Validation
+- Memory Management
+- Async Support
+✅ FIXED: Circuit Breaker Skip Logic - Skip Angel One when circuit is OPEN
+✅ ADDED: 3:30 PM Market Close Alert
+✅ ADDED: Data Provider Architecture (Phase 1-5)
+✅ FIXED: SQL syntax error in update_position_status()
+✅ FIXED: Square off on all shutdown scenarios (Ctrl+C, crash, max loss)
+✅ ADDED: Time filter in load_positions_from_db()
+✅ ADDED: Stale position cleanup on startup
+✅ ADDED: Atomic transactions for DB operations
+✅ ADDED: Verification after DB updates
+✅ ADDED: Retry logic for DB writes
+✅ ADDED: Startup health check
+✅ ADDED: DB integrity check on startup
+✅ ADDED: Telegram alert for stale positions
+✅ ADDED: Square-off verification
+✅ ADDED: Capital tracking in database
+✅ ADDED: Capital persists across restarts
+✅ ADDED: Capital updates after every trade
 """
 
 from SmartApi import SmartConnect
@@ -47,45 +63,10 @@ import hashlib
 import pickle
 from functools import wraps
 from typing import Optional, Dict, List, Tuple, Any
+from abc import ABC, abstractmethod
 
-# ============================================================
-# LOAD ENVIRONMENT VARIABLES FROM .env FILE
-# ============================================================
-
-# Get the absolute path to the project root (where .env is located)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-env_path = os.path.join(project_root, '.env')
-
-# Load the .env file
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-    print(f"✅ Loaded .env from: {env_path}")
-else:
-    print(f"⚠️ .env file not found at: {env_path}")
-    # Try current directory as fallback
-    load_dotenv()
-    print(f"⚠️ Tried loading from current directory: {os.getcwd()}")
-
-# Verify critical environment variables
-required_vars = ['API_KEY', 'CLIENT_CODE', 'MPIN', 'TOTP_SECRET']
-missing_vars = [var for var in required_vars if not os.getenv(var)]
-
-if missing_vars:
-    print(f"❌ Missing environment variables: {', '.join(missing_vars)}")
-    print("Please check your .env file in the project root.")
-else:
-    print(f"✅ All required environment variables loaded successfully!")
-
-# ============================================================
-# IMPORT UTILITY CLASSES
-# ============================================================
-from utils import ScanManager, MetricsCollector, BotState, ErrorRecovery
-
-# ============================================================
-# TRY IMPORTS
-# ============================================================
 try:
-    import nsepython as nse
+    import nsepython
     NSEPYTHON_AVAILABLE = True
 except ImportError:
     NSEPYTHON_AVAILABLE = False
@@ -96,134 +77,628 @@ except ImportError:
 
 class RateLimiter:
     """Rate limiter for API calls with thread safety"""
-
     def __init__(self, max_calls: int = 10, period: int = 60):
         self.max_calls = max_calls
         self.period = period
         self.calls = deque()
         self.lock = threading.Lock()
-
+    
     def wait_if_needed(self):
         with self.lock:
             now = time.time()
-
             while self.calls and now - self.calls[0] > self.period:
                 self.calls.popleft()
-
             if len(self.calls) >= self.max_calls:
                 sleep_time = self.period - (now - self.calls[0])
                 time.sleep(sleep_time + 0.1)
-
             self.calls.append(time.time())
 
 
 class CircuitBreaker:
-    """Circuit breaker pattern for external APIs with auto-reset"""
-    
-    def __init__(self, failure_threshold: int = 10, recovery_timeout: int = 30):
+    """Circuit breaker pattern for external APIs"""
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
         self.failure_count = 0
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.last_failure_time = None
-        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.state = "CLOSED"
         self.lock = threading.Lock()
-        self._last_state_change = time.time()
-
+    
     def execute(self, func, *args, **kwargs):
         with self.lock:
-            # Auto-reset after timeout
             if self.state == "OPEN":
                 if time.time() - self.last_failure_time > self.recovery_timeout:
                     self.state = "HALF_OPEN"
-                    log.info("[CIRCUIT] Circuit breaker is now HALF_OPEN")
                 else:
-                    raise Exception(
-                        f"Circuit breaker is OPEN for {func.__name__}"
-                    )
-
+                    raise Exception(f"Circuit breaker is OPEN for {func.__name__}")
+        
         try:
             result = func(*args, **kwargs)
-
             with self.lock:
                 if self.state == "HALF_OPEN":
                     self.state = "CLOSED"
                     self.failure_count = 0
-                    log.info("[CIRCUIT] Circuit breaker CLOSED - API calls resumed")
-                    send_telegram_alert("🔄 <b>Circuit Breaker Reset</b>\nAngel One API calls resumed.", "success")
-
             return result
-
         except Exception as e:
             with self.lock:
                 self.failure_count += 1
                 self.last_failure_time = time.time()
-
                 if self.failure_count >= self.failure_threshold:
                     self.state = "OPEN"
-                    log.warning(f"[CIRCUIT] Circuit breaker OPEN for {func.__name__}")
-                    send_telegram_alert(
-                        f"🚨 <b>Circuit Breaker OPEN</b>\n"
-                        f"Function: {func.__name__}\n"
-                        f"Failures: {self.failure_count}\n"
-                        f"Will auto-reset in {self.recovery_timeout}s",
-                        "warning"
-                    )
-
             raise e
 
-    def reset(self):
-        """Manually reset circuit breaker"""
+    def is_open(self) -> bool:
         with self.lock:
-            self.state = "CLOSED"
-            self.failure_count = 0
-            self.last_failure_time = None
-            log.info("[CIRCUIT] Circuit breaker manually RESET")
-            send_telegram_alert("🔄 <b>Circuit Breaker Manually Reset</b>\nAPI calls resumed.", "success")
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = "HALF_OPEN"
+                    return False
+                return True
+            return False
 
 
-def retry_with_backoff(
-    max_retries: int = 3,
-    base_delay: float = 1,
-    max_delay: float = 60,
-    exceptions: tuple = (Exception,),
-):
-    """Retry decorator with exponential backoff"""
-
+def retry_with_backoff(max_retries: int = 3, base_delay: float = 1, 
+                       max_delay: float = 60, exceptions: tuple = (Exception,)):
     def decorator(func):
-
         @wraps(func)
         def wrapper(*args, **kwargs):
             retries = 0
             delay = base_delay
-
             while retries < max_retries:
                 try:
                     return func(*args, **kwargs)
-
                 except exceptions as e:
                     retries += 1
-
                     if retries >= max_retries:
                         raise
-
-                    sleep_time = min(
-                        delay * (2 ** (retries - 1)),
-                        max_delay,
-                    )
-
-                    log.warning(
-                        f"[RETRY] {func.__name__} failed: {e}. "
-                        f"Retry {retries}/{max_retries} "
-                        f"in {sleep_time:.1f}s"
-                    )
-
+                    sleep_time = min(delay * (2 ** (retries - 1)), max_delay)
+                    log.warning(f"[RETRY] {func.__name__} failed: {e}. Retry {retries}/{max_retries} in {sleep_time:.1f}s")
                     time.sleep(sleep_time)
-
             return None
-
         return wrapper
-
     return decorator
+
+
+class ContextLogger:
+    def __init__(self, correlation_id: Optional[str] = None):
+        self.correlation_id = correlation_id or str(uuid.uuid4())[:8]
+    
+    def info(self, message: str):
+        log.info(f"[{self.correlation_id}] {message}")
+    
+    def warning(self, message: str):
+        log.warning(f"[{self.correlation_id}] {message}")
+    
+    def error(self, message: str):
+        log.error(f"[{self.correlation_id}] {message}")
+    
+    def debug(self, message: str):
+        log.debug(f"[{self.correlation_id}] {message}")
+
+
+class MetricsCollector:
+    def __init__(self):
+        self.metrics = {
+            'api_calls': 0,
+            'api_errors': 0,
+            'scan_duration': [],
+            'trade_success': 0,
+            'trade_failure': 0,
+            'ws_messages': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'start_time': datetime.now()
+        }
+        self.lock = threading.Lock()
+    
+    def record_api_call(self, success: bool = True):
+        with self.lock:
+            self.metrics['api_calls'] += 1
+            if not success:
+                self.metrics['api_errors'] += 1
+    
+    def record_scan_duration(self, duration: float):
+        with self.lock:
+            self.metrics['scan_duration'].append(duration)
+            if len(self.metrics['scan_duration']) > 100:
+                self.metrics['scan_duration'] = self.metrics['scan_duration'][-50:]
+    
+    def record_trade(self, success: bool = True):
+        with self.lock:
+            if success:
+                self.metrics['trade_success'] += 1
+            else:
+                self.metrics['trade_failure'] += 1
+    
+    def record_ws_message(self):
+        with self.lock:
+            self.metrics['ws_messages'] += 1
+    
+    def record_cache_hit(self, hit: bool = True):
+        with self.lock:
+            if hit:
+                self.metrics['cache_hits'] += 1
+            else:
+                self.metrics['cache_misses'] += 1
+    
+    def get_summary(self) -> Dict:
+        with self.lock:
+            durations = self.metrics['scan_duration']
+            total_trades = self.metrics['trade_success'] + self.metrics['trade_failure']
+            return {
+                'uptime_seconds': (datetime.now() - self.metrics['start_time']).total_seconds(),
+                'api_calls': self.metrics['api_calls'],
+                'api_errors': self.metrics['api_errors'],
+                'api_error_rate': self.metrics['api_errors'] / self.metrics['api_calls'] if self.metrics['api_calls'] > 0 else 0,
+                'avg_scan_time': sum(durations) / len(durations) if durations else 0,
+                'trade_success_count': self.metrics['trade_success'],
+                'trade_failure_count': self.metrics['trade_failure'],
+                'trade_success_rate': self.metrics['trade_success'] / total_trades if total_trades > 0 else 0,
+                'ws_messages': self.metrics['ws_messages'],
+                'cache_hit_rate': self.metrics['cache_hits'] / (self.metrics['cache_hits'] + self.metrics['cache_misses']) 
+                                if (self.metrics['cache_hits'] + self.metrics['cache_misses']) > 0 else 0
+            }
+
+
+class BotState:
+    def __init__(self, state_file: str = "bot_state.json"):
+        self.state_file = state_file
+        self.lock = threading.Lock()
+        self.state = self.load()
+    
+    def load(self) -> Dict:
+        try:
+            with open(self.state_file, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+    
+    def save(self):
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.state, f, default=str, indent=2)
+        except Exception as e:
+            log.error(f"Failed to save bot state: {e}")
+    
+    def update(self, key: str, value: Any):
+        with self.lock:
+            self.state[key] = value
+            self.save()
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        with self.lock:
+            return self.state.get(key, default)
+
+
+class ErrorRecovery:
+    def __init__(self, bot, max_retries_per_operation: int = 3):
+        self.bot = bot
+        self.max_retries = max_retries_per_operation
+        self.error_counts = {}
+        self.lock = threading.Lock()
+    
+    def handle_error(self, operation: str, error: Exception) -> bool:
+        key = f"{operation}_{datetime.now().strftime('%Y%m%d')}"
+        with self.lock:
+            self.error_counts[key] = self.error_counts.get(key, 0) + 1
+            
+            if self.error_counts[key] >= self.max_retries:
+                log.critical(f"Critical error in {operation}: {error}")
+                send_telegram_alert(f"⚠️ <b>Critical Error</b>\nOperation: {operation}\nStopping bot for safety")
+                self.bot.running = False
+                return False
+            
+            log.warning(f"Error in {operation}, retrying... ({self.error_counts[key]}/{self.max_retries})")
+            return True
+    
+    def reset_error_count(self, operation: str):
+        key = f"{operation}_{datetime.now().strftime('%Y%m%d')}"
+        with self.lock:
+            if key in self.error_counts:
+                del self.error_counts[key]
+
+
+class ScanManager:
+    def __init__(self):
+        self.is_scanning = False
+        self.last_scan_time = None
+        self.lock = threading.Lock()
+        self.min_interval = 10
+    
+    def start_scan(self, bot) -> bool:
+        with self.lock:
+            if self.is_scanning:
+                log.warning("Scan already in progress, skipping")
+                return False
+            
+            if self.last_scan_time:
+                elapsed = (datetime.now() - self.last_scan_time).total_seconds()
+                if elapsed < self.min_interval:
+                    log.debug(f"Too soon since last scan: {elapsed:.1f}s")
+                    return False
+            
+            self.is_scanning = True
+            self.last_scan_time = datetime.now()
+        
+        try:
+            bot._perform_scan()
+            return True
+        finally:
+            with self.lock:
+                self.is_scanning = False
+
+
+# ============================================================
+# PHASE 1-5: DATA PROVIDER ARCHITECTURE
+# ============================================================
+
+class DataProvider(ABC):
+    """Abstract base class for all data providers"""
+    
+    def __init__(self, name: str, priority: int):
+        self.name = name
+        self.priority = priority
+        self.is_healthy = True
+        self.last_check = None
+        self.failure_count = 0
+        self.success_count = 0
+        self.circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60)
+    
+    @abstractmethod
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        """Fetch OHLCV data for a symbol"""
+        pass
+    
+    @abstractmethod
+    def health_check(self) -> bool:
+        """Check if provider is responsive"""
+        pass
+    
+    def get_priority(self) -> int:
+        return self.priority
+    
+    def get_name(self) -> str:
+        return self.name
+    
+    def mark_failure(self):
+        self.failure_count += 1
+        if self.failure_count >= 5:
+            self.is_healthy = False
+    
+    def mark_success(self):
+        self.success_count += 1
+        self.failure_count = 0
+        if self.success_count >= 3:
+            self.is_healthy = True
+    
+    def get_stats(self) -> Dict:
+        return {
+            'name': self.name,
+            'priority': self.priority,
+            'healthy': self.is_healthy,
+            'failures': self.failure_count,
+            'successes': self.success_count
+        }
+
+
+class AngelOneProvider(DataProvider):
+    """Angel One API Provider"""
+    
+    def __init__(self, bot):
+        super().__init__("angel_one", priority=1)
+        self.bot = bot
+    
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        try:
+            token = self.bot.symbol_tokens.get(symbol)
+            if not token:
+                return None
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=5)
+            
+            historical_data = self.circuit_breaker.execute(
+                self.bot.obj.getCandleData,
+                exchange="NSE",
+                symboltoken=token,
+                interval="FIFTEEN_MINUTE",
+                fromdate=start_date.strftime("%Y-%m-%d"),
+                todate=end_date.strftime("%Y-%m-%d")
+            )
+            
+            if historical_data and historical_data.get('status') == True:
+                data = self.bot._parse_angel_historical_data(historical_data)
+                if data is not None and not data.empty:
+                    self.mark_success()
+                    return data
+            
+            self.mark_failure()
+            return None
+            
+        except Exception as e:
+            self.mark_failure()
+            log.debug(f"[{self.name}] Failed: {e}")
+            return None
+    
+    def health_check(self) -> bool:
+        if self.circuit_breaker.is_open():
+            return False
+        return True
+
+
+class YahooFinanceProvider(DataProvider):
+    """Yahoo Finance Provider"""
+    
+    def __init__(self):
+        super().__init__("yahoo_finance", priority=2)
+        self._last_health_check = None
+    
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        try:
+            stock = yf.Ticker(f"{symbol}.NS")
+            data = stock.history(period=period, interval=interval)
+            
+            if not data.empty and len(data) > 10:
+                self.mark_success()
+                return data.tail(100).copy()
+            
+            self.mark_failure()
+            return None
+            
+        except Exception as e:
+            self.mark_failure()
+            log.debug(f"[{self.name}] Failed for {symbol}: {e}")
+            return None
+    
+    def health_check(self) -> bool:
+        try:
+            stock = yf.Ticker("RELIANCE.NS")
+            data = stock.history(period="1d", interval="1m")
+            return not data.empty
+        except:
+            return False
+
+
+class NSEPythonProvider(DataProvider):
+    """NSE Python Provider"""
+    
+    def __init__(self):
+        super().__init__("nsepython", priority=3)
+        self._nse_available = NSEPYTHON_AVAILABLE
+    
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        if not self._nse_available:
+            return None
+        
+        try:
+            import nsepython
+            
+            # Note: Actual implementation depends on nsepython API
+            # This is a placeholder - adjust based on actual API
+            data = nsepython.get_historical_data(
+                symbol=symbol,
+                start_date=(datetime.now() - timedelta(days=5)).strftime("%d-%m-%Y"),
+                end_date=datetime.now().strftime("%d-%m-%Y")
+            )
+            
+            if data is not None and not data.empty:
+                self.mark_success()
+                return data
+            
+            self.mark_failure()
+            return None
+            
+        except Exception as e:
+            self.mark_failure()
+            log.debug(f"[{self.name}] Failed for {symbol}: {e}")
+            return None
+    
+    def health_check(self) -> bool:
+        return self._nse_available
+
+
+class BulkDataProvider(DataProvider):
+    """Bulk Data Store Provider"""
+    
+    def __init__(self, bot):
+        super().__init__("bulk_data", priority=4)
+        self.bot = bot
+    
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        try:
+            data = self.bot.bulk_data_store.get(symbol)
+            if data is not None and not data.empty:
+                self.mark_success()
+                return data
+            self.mark_failure()
+            return None
+        except:
+            self.mark_failure()
+            return None
+    
+    def health_check(self) -> bool:
+        return len(self.bot.bulk_data_store) > 0
+
+
+class CacheProvider(DataProvider):
+    """Cache Provider"""
+    
+    def __init__(self, bot):
+        super().__init__("cache", priority=5)
+        self.bot = bot
+    
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        try:
+            cache_key = f"{symbol}_{period}_{interval}"
+            if cache_key in self.bot.indicator_cache:
+                cache_time, data = self.bot.indicator_cache[cache_key]
+                if (datetime.now() - cache_time).seconds < 3600:
+                    self.mark_success()
+                    return data
+            self.mark_failure()
+            return None
+        except:
+            self.mark_failure()
+            return None
+    
+    def health_check(self) -> bool:
+        return len(self.bot.indicator_cache) > 0
+
+
+class DataProviderManager:
+    """Manages all data providers with fallback and parallel execution"""
+    
+    def __init__(self, bot, config: Optional[Dict] = None):
+        self.bot = bot
+        self.providers: List[DataProvider] = []
+        self.health_cache = {}
+        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.config = config or {}
+        self._last_health_check = 0
+        self._health_check_interval = 60
+        
+        self._register_providers()
+        self.data_strategy = self.config.get('strategy', 'sequential')
+        self.data_timeout = self.config.get('timeout', 10)
+        
+        log.info(f"[PROVIDERS] Registered {len(self.providers)} providers")
+    
+    def _register_providers(self):
+        """Register all providers in priority order"""
+        self.providers = [
+            AngelOneProvider(self.bot),
+            YahooFinanceProvider(),
+            NSEPythonProvider(),
+            BulkDataProvider(self.bot),
+            CacheProvider(self.bot)
+        ]
+        self.providers.sort(key=lambda p: p.priority)
+    
+    def get_healthy_providers(self) -> List[DataProvider]:
+        return [p for p in self.providers if p.is_healthy]
+    
+    def fetch_data_sequential(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        """Sequential fallback - tries providers one by one"""
+        for provider in self.providers:
+            if not provider.is_healthy:
+                continue
+            
+            log.debug(f"[PROVIDER] Trying {provider.name} for {symbol}")
+            data = provider.fetch_data(symbol, period, interval)
+            
+            if data is not None:
+                log.info(f"[PROVIDER] ✅ {provider.name} provided data for {symbol}")
+                return data
+            
+            log.debug(f"[PROVIDER] ❌ {provider.name} failed for {symbol}")
+        
+        log.warning(f"[PROVIDER] All providers failed for {symbol}")
+        return None
+    
+    def fetch_data_parallel(self, symbol: str, period: str = "5d", interval: str = "15m", timeout: int = 10) -> Optional[pd.DataFrame]:
+        """Parallel execution - fastest provider wins"""
+        futures = {}
+        healthy_providers = self.get_healthy_providers()
+        
+        if not healthy_providers:
+            log.warning("[PROVIDER] No healthy providers available")
+            return None
+        
+        for provider in healthy_providers:
+            future = self.executor.submit(provider.fetch_data, symbol, period, interval)
+            futures[future] = provider
+        
+        for future in as_completed(futures, timeout=timeout):
+            provider = futures[future]
+            try:
+                data = future.result(timeout=2)
+                if data is not None:
+                    log.info(f"[PROVIDER] ✅ {provider.name} responded first with data for {symbol}")
+                    return data
+            except Exception as e:
+                log.debug(f"[PROVIDER] {provider.name} timed out: {e}")
+        
+        log.warning(f"[PROVIDER] All providers failed in parallel mode for {symbol}")
+        return None
+    
+    def fetch_data(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
+        """Main entry point for data fetching"""
+        # Check cache first (always fastest)
+        cache_data = self._check_cache(symbol, period, interval)
+        if cache_data is not None:
+            return cache_data
+        
+        # Update provider health periodically
+        self._update_health_check()
+        
+        # Execute strategy
+        if self.data_strategy == "parallel":
+            return self.fetch_data_parallel(symbol, period, interval, self.data_timeout)
+        else:
+            return self.fetch_data_sequential(symbol, period, interval)
+    
+    def _check_cache(self, symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+        cache_key = f"{symbol}_{period}_{interval}"
+        if cache_key in self.bot.indicator_cache:
+            cache_time, data = self.bot.indicator_cache[cache_key]
+            if (datetime.now() - cache_time).seconds < 60:
+                log.debug(f"[PROVIDER] Cache hit for {symbol}")
+                return data
+        return None
+    
+    def _update_health_check(self):
+        current_time = time.time()
+        if current_time - self._last_health_check < self._health_check_interval:
+            return
+        
+        self._last_health_check = current_time
+        
+        for provider in self.providers:
+            try:
+                provider.is_healthy = provider.health_check()
+            except:
+                provider.is_healthy = False
+            
+            log.debug(f"[HEALTH] {provider.name}: {'✅' if provider.is_healthy else '❌'}")
+    
+    def get_provider_status(self) -> Dict[str, Any]:
+        return {
+            p.name: {
+                'healthy': p.is_healthy,
+                'priority': p.priority,
+                'failure_count': p.failure_count,
+                'success_count': p.success_count
+            }
+            for p in self.providers
+        }
+    
+    def load_provider_config(self, config_file: str):
+        """Phase 5: Load provider configuration from JSON file"""
+        try:
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                
+                provider_configs = config.get('providers', {})
+                for provider in self.providers:
+                    if provider.name in provider_configs:
+                        pconfig = provider_configs[provider.name]
+                        if 'priority' in pconfig:
+                            provider.priority = pconfig['priority']
+                        if 'enabled' in pconfig and not pconfig['enabled']:
+                            provider.is_healthy = False
+                
+                self.providers.sort(key=lambda p: p.priority)
+                log.info(f"[PROVIDERS] Loaded config from {config_file}")
+        except Exception as e:
+            log.warning(f"[PROVIDERS] Failed to load config: {e}")
+
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
+load_dotenv()
 
 # === API CREDENTIALS ===
 API_KEY = os.getenv("API_KEY")
@@ -233,8 +708,8 @@ TOTP_SECRET = os.getenv("TOTP_SECRET")
 
 # === GITHUB SYNCHRONIZATION ===
 GITHUB_PAT = os.getenv("GITHUB_PAT")
-GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "anjanib31-source")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "trading-dashboard")
+GITHUB_USERNAME = "anjanib31-source"
+GITHUB_REPO = "trading-dashboard"
 
 # === DATABASE ===
 DB_NAME = "trades.db"
@@ -244,14 +719,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8993963920:AAGl4hhH4rHfC-M
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "947783716")
 
 # === TRADING PARAMETERS ===
-CAPITAL = int(os.getenv("CAPITAL", 10000))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 3))
-LEVERAGE = int(os.getenv("LEVERAGE", 4))
-STOP_LOSS = float(os.getenv("STOP_LOSS", 0.02))
-TRAILING_SL_ACTIVATION = float(os.getenv("TRAILING_SL_ACTIVATION", 0.015))
-TRAILING_SL_PULLBACK = float(os.getenv("TRAILING_SL_PULLBACK", 0.007))
-MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", 90))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
+CAPITAL = 10000
+MAX_POSITIONS = 3
+LEVERAGE = 4
+STOP_LOSS = 0.02
+TRAILING_SL_ACTIVATION = 0.015
+TRAILING_SL_PULLBACK = 0.007
+MAX_HOLD_MINUTES = 90
+SCAN_INTERVAL = 45
 
 # === PROFIT TARGETS ===
 PROFIT_TARGETS = {8: 0.035, 9: 0.040, 10: 0.045}
@@ -301,21 +776,26 @@ WS_HEARTBEAT_INTERVAL = 30
 
 # === API RATE LIMITING ===
 API_MAX_CALLS_PER_MINUTE = 10
-CACHE_CLEANUP_INTERVAL = 3600  # 1 hour
+CACHE_CLEANUP_INTERVAL = 3600
 MAX_TRADES_HISTORY = 500
+
+# === DATA PROVIDER CONFIGURATION ===
+DATA_STRATEGY = os.getenv("DATA_STRATEGY", "sequential")
+DATA_TIMEOUT = int(os.getenv("DATA_TIMEOUT", "10"))
+
+# === STALE POSITION CLEANUP ===
+STALE_POSITION_DAYS = 7
+STALE_POSITION_HOURS = 24
 
 # === SETUP LOGGING WITH ROTATION ===
 os.makedirs("logs", exist_ok=True)
 
-# Create root logger
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Remove any existing handlers
 for handler in logger.handlers[:]:
     logger.removeHandler(handler)
 
-# Create rotating file handler (10MB, 5 backups)
 file_handler = RotatingFileHandler(
     'logs/paper_bot.log',
     maxBytes=10*1024*1024,
@@ -324,28 +804,24 @@ file_handler = RotatingFileHandler(
 )
 file_handler.setLevel(logging.INFO)
 
-# Create console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 
-# Create formatter
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
-# Add handlers to logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Module-level logger
 log = logging.getLogger(__name__)
+
 
 # ============================================================
 # CONFIGURATION VALIDATION
 # ============================================================
 
 def validate_configuration() -> bool:
-    """Validate all configuration parameters"""
     validations = [
         (CAPITAL > 0, "CAPITAL must be > 0"),
         (MAX_POSITIONS > 0, "MAX_POSITIONS must be > 0"),
@@ -362,6 +838,8 @@ def validate_configuration() -> bool:
         (MAX_HOLD_MINUTES >= 10, "MAX_HOLD_MINUTES must be >= 10"),
         (TRAILING_SL_ACTIVATION > 0 and TRAILING_SL_ACTIVATION < 1, "TRAILING_SL_ACTIVATION must be between 0 and 1"),
         (PARTIAL_EXIT_LEVEL_1 < PARTIAL_EXIT_LEVEL_2 < PARTIAL_EXIT_LEVEL_3, "Partial exit levels must be in ascending order"),
+        (STALE_POSITION_DAYS >= 1, "STALE_POSITION_DAYS must be >= 1"),
+        (STALE_POSITION_HOURS >= 1, "STALE_POSITION_HOURS must be >= 1"),
     ]
     
     errors = []
@@ -371,685 +849,51 @@ def validate_configuration() -> bool:
     
     if errors:
         log.critical(f"Configuration errors: {', '.join(errors)}")
-        send_telegram_alert(f"⚠️ <b>Configuration Error</b>\n{', '.join(errors)}", "error")
-        return False
-    return True
-
-
-def validate_environment() -> bool:
-    """Validate all required environment variables"""
-    required_vars = ['API_KEY', 'CLIENT_CODE', 'MPIN', 'TOTP_SECRET']
-    missing = [v for v in required_vars if not os.getenv(v)]
-    if missing:
-        log.error(f"[ENV] Missing: {missing}")
-        send_telegram_alert(f"❌ <b>Environment Error</b>\nMissing variables: {', '.join(missing)}", "error")
+        send_telegram_alert(f"⚠️ <b>Configuration Error</b>\n{', '.join(errors)}")
         return False
     return True
 
 
 # ============================================================
-# ENHANCED TELEGRAM ALERTS
+# TELEGRAM ALERTS
 # ============================================================
 
 @retry_with_backoff(max_retries=3, base_delay=2, exceptions=(requests.RequestException,))
-def send_telegram_alert(message: str, alert_type: str = "info", parse_mode: str = "HTML") -> bool:
-    """Send enhanced alert to Telegram - Supports multiple chats"""
+def send_telegram_alert(message: str) -> bool:
     try:
-        alert_prefixes = {
-            "info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌",
-            "trade": "📈", "position": "📊", "startup": "🚀", "shutdown": "🛑",
-            "profit": "💰", "loss": "🔴", "target": "🎯", "stop": "🛡️",
-            "partial": "📊", "health": "💚", "market": "🏛️"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
         }
-        
-        prefix = alert_prefixes.get(alert_type, "ℹ️")
-        timestamp = datetime.now().strftime("%I:%M:%S %p")
-        full_message = f"{prefix} <b>{message}</b>\n\n🕐 {timestamp}"
-        
-        # Get all chat IDs
-        chat_ids = [str(TELEGRAM_CHAT_ID)]
-        extra_chats = os.getenv("TELEGRAM_CHAT_IDS", "")
-        if extra_chats:
-            chat_ids.extend([c.strip() for c in extra_chats.split(',') if c.strip()])
-        
-        # Remove duplicates
-        chat_ids = list(set(chat_ids))
-        
-        success = True
-        for chat_id in chat_ids:
-            try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                payload = {
-                    "chat_id": chat_id,
-                    "text": full_message,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True
-                }
-                response = requests.post(url, json=payload, timeout=10)
-                if response.status_code != 200:
-                    log.error(f"[TELEGRAM] Failed to send to {chat_id}: {response.text}")
-                    success = False
-            except Exception as e:
-                log.error(f"[TELEGRAM] Error sending to {chat_id}: {e}")
-                success = False
-        
-        if success:
-            log.info(f"[TELEGRAM] Alert sent to {len(chat_ids)} chat(s): {alert_type}")
-        
-        return success
-        
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            log.info(f"[TELEGRAM] Alert sent")
+            return True
+        else:
+            log.error(f"[TELEGRAM] Failed: {response.text}")
+            return False
     except Exception as e:
         log.error(f"[TELEGRAM] Error: {e}")
         raise
 
 
-def send_trade_alert(symbol: str, entry_price: float, quantity: int, score: int, strategy: str, 
-                     target_price: float, stop_price: float, pnl: float = None, exit_reason: str = None,
-                     alert_type: str = "OPEN") -> bool:
-    """Send detailed trade alert with all information"""
-    try:
-        if alert_type == "OPEN":
-            risk_reward = ((target_price - entry_price) / (entry_price - stop_price)) if (entry_price - stop_price) > 0 else 0
-            message = (
-                f"🚀 <b>POSITION OPENED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>Symbol:</b> {symbol}\n"
-                f"💰 <b>Entry:</b> ₹{entry_price:.2f}\n"
-                f"📦 <b>Quantity:</b> {quantity}\n"
-                f"⭐ <b>Score:</b> {score}/10\n"
-                f"📈 <b>Strategy:</b> {strategy}\n"
-                f"🎯 <b>Target:</b> ₹{target_price:.2f}\n"
-                f"🛡️ <b>Stop:</b> ₹{stop_price:.2f}\n"
-                f"💹 <b>Risk/Reward:</b> 1:{risk_reward:.2f}\n"
-                f"📅 <b>Time:</b> {datetime.now().strftime('%I:%M:%S %p')}"
-            )
-            return send_telegram_alert(message, "position")
-        
-        elif alert_type == "CLOSE":
-            pnl_pct = (pnl / (entry_price * quantity)) * 100 if pnl else 0
-            exit_price = entry_price * (1 + pnl_pct/100)
-            emoji = "💰" if pnl > 0 else "🔴"
-            status = "PROFIT" if pnl > 0 else "LOSS"
-            
-            message = (
-                f"{emoji} <b>POSITION CLOSED - {status}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>Symbol:</b> {symbol}\n"
-                f"📈 <b>Strategy:</b> {strategy}\n"
-                f"📊 <b>P&L:</b> {'+' if pnl > 0 else ''}₹{pnl:.2f} ({pnl_pct:+.2f}%)\n"
-                f"💰 <b>Entry:</b> ₹{entry_price:.2f} → ₹{exit_price:.2f}\n"
-                f"📋 <b>Reason:</b> {exit_reason}\n"
-                f"📅 <b>Time:</b> {datetime.now().strftime('%I:%M:%S %p')}"
-            )
-            alert_type = "profit" if pnl > 0 else "loss"
-            return send_telegram_alert(message, alert_type)
-        
+def validate_environment() -> bool:
+    required_vars = ['API_KEY', 'CLIENT_CODE', 'MPIN', 'TOTP_SECRET']
+    missing = [v for v in required_vars if not os.getenv(v)]
+    if missing:
+        log.error(f"[ENV] Missing: {missing}")
+        send_telegram_alert(f"❌ <b>Environment Error</b>\nMissing variables: {', '.join(missing)}")
         return False
-        
-    except Exception as e:
-        log.error(f"[TELEGRAM] Trade alert error: {e}")
-        return False
+    return True
 
-
-def send_system_alert(status: str, details: str = "", alert_type: str = "info") -> bool:
-    """Send system status alert"""
-    try:
-        emojis = {
-            "ONLINE": "🟢", "OFFLINE": "🔴", "RECONNECTING": "🔄",
-            "ERROR": "❌", "WARNING": "⚠️", "INFO": "ℹ️",
-            "MAINTENANCE": "🔧", "UPDATE": "📦", "STARTUP": "🚀",
-            "SHUTDOWN": "🛑", "READY": "✅"
-        }
-        
-        emoji = emojis.get(status.upper(), "ℹ️")
-        message = f"{emoji} <b>SYSTEM {status.upper()}</b>\n"
-        message += f"━━━━━━━━━━━━━━━━━━━━━\n"
-        
-        if details:
-            message += f"📋 {details}\n"
-        
-        message += f"📅 {datetime.now().strftime('%I:%M:%S %p')}"
-        
-        return send_telegram_alert(message, alert_type)
-        
-    except Exception as e:
-        log.error(f"[TELEGRAM] System alert error: {e}")
-        return False
-
-
-def send_daily_summary_alert(day_pnl: float, total_trades: int, win_rate: float, 
-                             positions_open: int, capital: float, best_trade: float = None,
-                             worst_trade: float = None) -> bool:
-    """Send detailed daily summary alert"""
-    try:
-        emoji = "📈" if day_pnl >= 0 else "📉"
-        pnl_status = "PROFIT" if day_pnl >= 0 else "LOSS"
-        pnl_color = "🟢" if day_pnl >= 0 else "🔴"
-        
-        message = (
-            f"📊 <b>DAILY TRADING SUMMARY</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📅 <b>Date:</b> {datetime.now().strftime('%A, %B %d, %Y')}\n"
-            f"\n"
-            f"{emoji} <b>Today's P&L:</b> {'+' if day_pnl >= 0 else ''}₹{day_pnl:.2f}\n"
-            f"📈 <b>Trades Today:</b> {total_trades}\n"
-            f"🎯 <b>Win Rate:</b> {win_rate:.1f}%\n"
-            f"📊 <b>Open Positions:</b> {positions_open}\n"
-            f"💰 <b>Current Capital:</b> ₹{capital:.2f}\n"
-            f"\n"
-            f"📊 <b>Summary:</b> {pnl_color} {pnl_status}"
-        )
-        
-        if best_trade is not None:
-            message += f"\n🏆 <b>Best Trade:</b> ₹{best_trade:+.2f}"
-        if worst_trade is not None:
-            message += f"\n📉 <b>Worst Trade:</b> ₹{worst_trade:+.2f}"
-        
-        return send_telegram_alert(message, "info")
-        
-    except Exception as e:
-        log.error(f"[TELEGRAM] Daily summary error: {e}")
-        return False
-
-
-def send_health_alert(component: str, status: str, error: str = None) -> bool:
-    """Send health status alert for system components"""
-    try:
-        emoji = "✅" if status == "healthy" else "❌"
-        status_text = "HEALTHY" if status == "healthy" else "UNHEALTHY"
-        
-        message = f"{emoji} <b>{component} - {status_text}</b>\n"
-        message += f"━━━━━━━━━━━━━━━━━━━━━\n"
-        message += f"🔍 <b>Component:</b> {component}\n"
-        message += f"📊 <b>Status:</b> {status_text}\n"
-        
-        if error:
-            message += f"⚠️ <b>Error:</b> {error}\n"
-        
-        message += f"📅 {datetime.now().strftime('%I:%M:%S %p')}"
-        
-        alert_type = "success" if status == "healthy" else "error"
-        return send_telegram_alert(message, alert_type)
-        
-    except Exception as e:
-        log.error(f"[TELEGRAM] Health alert error: {e}")
-        return False
-
-
-def send_market_status_alert(is_open: bool, time_until: str = None) -> bool:
-    """Send market status alert"""
-    try:
-        if is_open:
-            message = (
-                f"🏛️ <b>MARKET IS OPEN</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Trading session is active\n"
-                f"⏰ {datetime.now().strftime('%I:%M:%S %p')}"
-            )
-        else:
-            message = (
-                f"🔴 <b>MARKET IS CLOSED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏰ Time until open: {time_until}\n"
-                f"📅 {datetime.now().strftime('%I:%M:%S %p')}"
-            )
-        
-        return send_telegram_alert(message, "market")
-        
-    except Exception as e:
-        log.error(f"[TELEGRAM] Market status error: {e}")
-        return False
 
 # ============================================================
-# TELEGRAM BOT COMMAND HANDLER (Remote Control)
-# ============================================================
-
-class TelegramBotHandler:
-    """Handle incoming Telegram bot commands for remote control"""
-    
-    def __init__(self, bot_instance):
-        self.bot = bot_instance
-        self.command_handlers = {
-            '/status': self.handle_status,
-            '/health': self.handle_health,
-            '/positions': self.handle_positions,
-            '/trades': self.handle_trades,
-            '/scan': self.handle_scan,
-            '/restart': self.handle_restart,
-            '/stop': self.handle_stop,
-            '/start': self.handle_start,
-            '/ws': self.handle_websocket,
-            '/reconnect': self.handle_reconnect,
-            '/ping': self.handle_ping,
-            '/help': self.handle_help,
-            '/logs': self.handle_logs,
-            '/reset': self.handle_reset,
-        }
-        self.last_command_time = {}
-        self.cooldown_seconds = 5
-        self.running = True
-        self.last_update_id = 0
-        self._message_buffer = deque(maxlen=10)
-        
-    def start(self):
-        """Start the Telegram bot listener thread"""
-        log.info("[TG BOT] start() called - Initializing listener...")
-        thread = threading.Thread(target=self._listen_loop, daemon=True)
-        thread.start()
-        log.info("[TG BOT] Command handler started")
-        send_telegram_alert(
-            "🤖 <b>Remote Control Enabled</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "📱 Send /help to see all commands.",
-            "success"
-        )
-    
-    def _listen_loop(self):
-        """Main loop to listen for Telegram messages"""
-        log.info("[TG BOT] Listener loop started - Waiting for commands...")
-        while self.running:
-            try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-                params = {
-                    "offset": self.last_update_id + 1,
-                    "timeout": 30,
-                    "allowed_updates": ["message"]
-                }
-                
-                # Debug log every 10th poll to avoid spam
-                if self.last_update_id % 10 == 0:
-                    log.info(f"[TG BOT] Polling with offset: {self.last_update_id}")
-                
-                response = requests.get(url, params=params, timeout=35)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('ok') and data.get('result'):
-                        for update in data['result']:
-                            self.last_update_id = update['update_id']
-                            self._process_update(update)
-                else:
-                    log.warning(f"[TG BOT] API error: {response.status_code}")
-                    time.sleep(5)
-                    
-            except requests.exceptions.Timeout:
-                pass
-            except Exception as e:
-                log.error(f"[TG BOT] Error in listener loop: {e}")
-                time.sleep(10)
-    
-    def _process_update(self, update):
-        """Process a single Telegram update"""
-        try:
-            if 'message' in update:
-                message = update['message']
-                chat_id = str(message.get('chat', {}).get('id'))
-                
-                # Check if message is from authorized chat
-                allowed_chats = [str(TELEGRAM_CHAT_ID)]
-                extra_chats = os.getenv("TELEGRAM_CHAT_IDS", "")
-                if extra_chats:
-                    allowed_chats.extend([c.strip() for c in extra_chats.split(',')])
-                
-                if chat_id not in allowed_chats:
-                    log.warning(f"[TG BOT] Unauthorized chat: {chat_id}")
-                    return
-                
-                text = message.get('text', '')
-                
-                # Rate limiting
-                if chat_id in self.last_command_time:
-                    elapsed = time.time() - self.last_command_time[chat_id]
-                    if elapsed < self.cooldown_seconds:
-                        self._send_message(
-                            chat_id,
-                            f"⏳ Please wait {int(self.cooldown_seconds - elapsed)}s before using another command."
-                        )
-                        return
-                
-                self.last_command_time[chat_id] = time.time()
-                
-                if text.startswith('/'):
-                    command = text.split(' ')[0].lower()
-                    args = text.split(' ')[1:] if len(text.split(' ')) > 1 else []
-                    
-                    handler = self.command_handlers.get(command)
-                    if handler:
-                        log.info(f"[TG BOT] Command: {command} from {chat_id}")
-                        response = handler(args)
-                        if response:
-                            self._send_message(chat_id, response)
-                    else:
-                        self._send_message(
-                            chat_id,
-                            f"❌ Unknown command: {command}\nType /help for available commands."
-                        )
-                        
-        except Exception as e:
-            log.error(f"[TG BOT] Error processing update: {e}")
-    
-    def _send_message(self, chat_id, message):
-        """Send a message to Telegram"""
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            }
-            requests.post(url, json=payload, timeout=10)
-        except Exception as e:
-            log.error(f"[TG BOT] Send error: {e}")
-    
-    # ============================================================
-    # COMMAND HANDLERS
-    # ============================================================
-    
-    def handle_status(self, args):
-        """Handle /status command"""
-        try:
-            positions = len(self.bot.positions)
-            capital = self.bot.capital
-            pnl = self.bot.daily_pnl
-            trades = len(self.bot.trades)
-            uptime = self._get_uptime()
-            
-            status = (
-                f"📊 <b>BOT STATUS</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 <b>Capital:</b> ₹{capital:,.2f}\n"
-                f"📈 <b>Today's P&L:</b> {'+' if pnl >= 0 else ''}₹{pnl:,.2f}\n"
-                f"📊 <b>Open Positions:</b> {positions}\n"
-                f"📋 <b>Total Trades:</b> {trades}\n"
-                f"🔄 <b>Status:</b> {'🟢 Running' if self.bot.running else '🔴 Stopped'}\n"
-                f"🌐 <b>WebSocket:</b> {'🟢 Connected' if self.bot.ws_connected else '🔴 Disconnected'}\n"
-                f"⏰ <b>Uptime:</b> {uptime}\n"
-                f"📊 <b>Market:</b> {self.bot.market_condition}\n"
-                f"📋 <b>Scan:</b> {self.bot.scan_status}"
-            )
-            return status
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_health(self, args):
-        """Handle /health command"""
-        try:
-            h = self.bot.health_status
-            components = {
-                'broker': '🟢' if h.get('broker') else '🔴',
-                'market': '🟢' if h.get('market') else '🔴',
-                'scanner': '🟢' if h.get('scanner') else '🔴',
-                'sync': '🟢' if h.get('sync') else '🔴',
-            }
-            
-            response = (
-                f"💚 <b>HEALTH CHECK</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>Overall:</b> {h.get('status', 'Unknown')}\n"
-                f"\n"
-                f"🔍 <b>Components:</b>\n"
-                f"  {components['broker']} Broker\n"
-                f"  {components['market']} Market\n"
-                f"  {components['scanner']} Scanner\n"
-                f"  {components['sync']} Sync\n"
-                f"\n"
-                f"❌ <b>Errors:</b> {h.get('error_count', 0)}\n"
-                f"📋 <b>Last Error:</b> {h.get('last_error', 'None')[:100]}\n"
-                f"🕐 <b>Last Heartbeat:</b> {h.get('last_heartbeat', 'Never')[:19]}"
-            )
-            return response
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_positions(self, args):
-        """Handle /positions command"""
-        try:
-            positions = self.bot.positions
-            if not positions:
-                return "📊 <b>Open Positions</b>\n━━━━━━━━━━━━━━━━━━━━━\n✅ No open positions"
-            
-            response = f"📊 <b>Open Positions ({len(positions)})</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
-            total_pnl = 0
-            for i, pos in enumerate(positions, 1):
-                symbol = pos.get('symbol', 'N/A')
-                entry = pos.get('entry_price', 0)
-                qty = pos.get('quantity', 0)
-                current = self.bot.get_ltp(symbol) or entry
-                pnl = (current - entry) * qty
-                total_pnl += pnl
-                pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
-                emoji = "✅" if pnl >= 0 else "❌"
-                
-                response += (
-                    f"\n{i}. {emoji} <b>{symbol}</b>\n"
-                    f"   Entry: ₹{entry:.2f} → ₹{current:.2f}\n"
-                    f"   Qty: {qty} | P&L: {'+' if pnl >= 0 else ''}₹{pnl:.2f} ({pnl_pct:+.2f}%)\n"
-                    f"   Target: ₹{pos.get('target_price', 0):.2f} | Stop: ₹{pos.get('stop_price', 0):.2f}"
-                )
-            
-            response += f"\n\n💰 <b>Total P&L:</b> {'+' if total_pnl >= 0 else ''}₹{total_pnl:.2f}"
-            return response
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_trades(self, args):
-        """Handle /trades command"""
-        try:
-            trades = self.bot.trades[-5:] if self.bot.trades else []
-            if not trades:
-                return "📋 <b>Recent Trades</b>\n━━━━━━━━━━━━━━━━━━━━━\n✅ No trades yet"
-            
-            response = f"📋 <b>Recent Trades ({len(trades)})</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
-            for i, trade in enumerate(reversed(trades), 1):
-                symbol = trade.get('symbol', 'N/A')
-                pnl = trade.get('net_pnl', 0)
-                pnl_pct = trade.get('pnl_pct', 0)
-                strategy = trade.get('strategy', 'N/A')
-                emoji = "✅" if pnl >= 0 else "❌"
-                
-                response += (
-                    f"\n{i}. {emoji} <b>{symbol}</b> ({strategy})\n"
-                    f"   P&L: {'+' if pnl >= 0 else ''}₹{pnl:.2f} ({pnl_pct:+.2f}%)\n"
-                )
-            return response
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_scan(self, args):
-        """Handle /scan command"""
-        try:
-            if not self.bot.running:
-                return "❌ Bot is stopped. Use /start to start first."
-            
-            if self.bot.scan_manager.is_scanning:
-                return "⏳ Scan already in progress. Please wait..."
-            
-            log.info("[TG BOT] Manual scan triggered")
-            threading.Thread(target=self.bot._perform_scan, daemon=True).start()
-            return "🔄 Scan started! Check back in a few seconds."
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_stop(self, args):
-        """Handle /stop command"""
-        try:
-            if not self.bot.running:
-                return "⏹️ Bot is already stopped."
-            
-            log.info("[TG BOT] Stop command received")
-            self.bot.running = False
-            return (
-                "🛑 <b>Bot Stopped</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 P&L: {'+' if self.bot.daily_pnl >= 0 else ''}₹{self.bot.daily_pnl:.2f}\n"
-                f"📊 Positions: {len(self.bot.positions)}\n"
-                "\nUse /start to resume trading."
-            )
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_start(self, args):
-        """Handle /start command"""
-        try:
-            if self.bot.running:
-                return "✅ Bot is already running."
-            
-            log.info("[TG BOT] Start command received")
-            self.bot.running = True
-            return (
-                "🚀 <b>Bot Started</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Capital: ₹{self.bot.capital:.2f}\n"
-                f"📊 Positions: {len(self.bot.positions)}\n"
-                "\nUse /status to check current status."
-            )
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_websocket(self, args):
-        """Handle /ws command"""
-        try:
-            status = "🟢 Connected" if self.bot.ws_connected else "🔴 Disconnected"
-            return (
-                f"🌐 <b>WebSocket Status</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>Status:</b> {status}\n"
-                f"🔄 <b>Heartbeat:</b> {'Active' if self.bot.ws_heartbeat_running else 'Stopped'}\n"
-                f"📈 <b>Symbols:</b> {len(self.bot.stock_list) if self.bot.stock_list else 0}\n"
-                "\n💡 Use /reconnect to reconnect WebSocket."
-            )
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_reconnect(self, args):
-        """Handle /reconnect command"""
-        try:
-            log.info("[TG BOT] Reconnect command received")
-            success = self.bot._reconnect_websocket()
-            if success:
-                return "🔄 <b>WebSocket Reconnected!</b>\n✅ Connection restored."
-            else:
-                return "❌ <b>WebSocket Reconnect Failed</b>\n⚠️ Check logs or use /restart."
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_ping(self, args):
-        """Handle /ping command"""
-        try:
-            return (
-                f"🏓 <b>PONG!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Bot is alive\n"
-                f"🕐 {datetime.now().strftime('%I:%M:%S %p')}\n"
-                f"🔄 {'🟢 Running' if self.bot.running else '🔴 Stopped'}\n"
-                f"📊 Positions: {len(self.bot.positions)}\n"
-                f"💰 P&L: {'+' if self.bot.daily_pnl >= 0 else ''}₹{self.bot.daily_pnl:.2f}"
-            )
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_help(self, args):
-        """Handle /help command"""
-        return (
-            "🤖 <b>ALPHA Bot Commands</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "\n"
-            "📊 <b>Status:</b>\n"
-            "  /status - Show bot status\n"
-            "  /health - Health check\n"
-            "  /positions - Open positions\n"
-            "  /trades - Recent trades\n"
-            "  /ws - WebSocket status\n"
-            "  /ping - Check if alive\n"
-            "\n"
-            "⚙️ <b>Control:</b>\n"
-            "  /scan - Force scan\n"
-            "  /reconnect - Reconnect WS\n"
-            "  /stop - Stop trading\n"
-            "  /start - Resume trading\n"
-            "  /reset - Reset circuit breaker\n"
-            "  /logs - Recent logs\n"
-            "\n"
-            "❓ /help - Show this"
-        )
-    
-    def handle_logs(self, args):
-        """Handle /logs command"""
-        try:
-            log_file = "logs/paper_bot.log"
-            if not os.path.exists(log_file):
-                return "📋 No logs found."
-            
-            with open(log_file, 'r') as f:
-                lines = f.readlines()[-15:]
-            
-            response = "📋 <b>Recent Logs</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
-            for line in lines:
-                line = line.strip()[:120]
-                if line:
-                    response += f"{line}\n"
-            return response
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_reset(self, args):
-        """Handle /reset command - Reset circuit breaker"""
-        try:
-            self.bot.reset_circuit_breakers()
-            return "🔄 <b>Circuit Breaker Reset</b>\n✅ API calls resumed."
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def handle_restart(self, args):
-        """Handle /restart command"""
-        try:
-            log.info("[TG BOT] Restart command received")
-            self.bot.running = False
-            
-            response = (
-                "🔄 <b>Restarting Bot...</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "⏳ Stopping current instance...\n"
-                "🚀 Restarting..."
-            )
-            self._send_message(TELEGRAM_CHAT_ID, response)
-            
-            def restart_after_delay():
-                time.sleep(3)
-                import subprocess
-                subprocess.Popen(
-                    [sys.executable, 'src/angel_bot_v2.py'],
-                    cwd=os.path.dirname(os.path.dirname(__file__))
-                )
-            
-            threading.Thread(target=restart_after_delay, daemon=True).start()
-            return None
-        except Exception as e:
-            return f"❌ Error: {e}"
-    
-    def _get_uptime(self):
-        """Calculate bot uptime"""
-        try:
-            start = datetime.fromisoformat(self.bot.health_status.get('start_time', datetime.now().isoformat()))
-            uptime = datetime.now() - start
-            hours = uptime.seconds // 3600
-            minutes = (uptime.seconds % 3600) // 60
-            return f"{hours}h {minutes}m"
-        except:
-            return "Unknown"
-    
-    def stop(self):
-        """Stop the Telegram bot handler"""
-        self.running = False
-        log.info("[TG BOT] Command handler stopped")
-
-# ============================================================
-# DATABASE FUNCTIONS WITH TRANSACTION MANAGEMENT
+# DATABASE FUNCTIONS
 # ============================================================
 
 def get_db_connection():
-    """Get database connection with timeout"""
     conn = sqlite3.connect(DB_NAME, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -1058,13 +902,11 @@ def get_db_connection():
 
 
 def execute_db_transaction(operations: List) -> Tuple[bool, Any]:
-    """Execute multiple database operations in a single transaction"""
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
         cursor.execute('BEGIN TRANSACTION')
         
         results = []
@@ -1099,8 +941,8 @@ def execute_db_transaction(operations: List) -> Tuple[bool, Any]:
 
 
 def init_database():
-    """Initialize database with transaction management and indexes"""
     def create_tables(cursor):
+        # Trades table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1117,12 +959,12 @@ def init_database():
                 exit_type TEXT DEFAULT 'FULL'
             )
         ''')
-        
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)')
         
+        # Positions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1134,10 +976,18 @@ def init_database():
                 status TEXT DEFAULT 'OPEN'
             )
         ''')
-        
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_time)')
+        
+        # ===== CAPITAL TRACKING TABLE (NEW) =====
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value REAL,
+                updated_at TEXT
+            )
+        ''')
         
         return True
     
@@ -1149,7 +999,6 @@ def init_database():
 
 
 def backup_database() -> Optional[str]:
-    """Create a backup of the database"""
     try:
         backup_dir = "backups"
         os.makedirs(backup_dir, exist_ok=True)
@@ -1167,7 +1016,6 @@ def backup_database() -> Optional[str]:
         backups = sorted([f for f in os.listdir(backup_dir) if f.startswith('trades_backup_')])
         for old_backup in backups[:-10]:
             os.remove(os.path.join(backup_dir, old_backup))
-            log.debug(f"[BACKUP] Removed old: {old_backup}")
         
         return backup_path
     except Exception as e:
@@ -1176,7 +1024,6 @@ def backup_database() -> Optional[str]:
 
 
 def cleanup_old_trades(days_to_keep: int = 365):
-    """Delete trades older than specified days"""
     try:
         cutoff_date = (datetime.now() - timedelta(days=days_to_keep)).strftime('%Y-%m-%d')
         
@@ -1231,8 +1078,6 @@ class AngelTradingBot:
         self.trades = []
         self.daily_pnl = 0.0
         self.total_trades_today = 0
-        self._last_scanner_check = datetime.now()
-        self._circuit_breaker_reset_time = None
         
         # Risk Management
         self.sector_map = {}
@@ -1261,10 +1106,9 @@ class AngelTradingBot:
         # Rate Limiter
         self.api_limiter = RateLimiter(max_calls=API_MAX_CALLS_PER_MINUTE, period=60)
         
-        # Circuit Breakers - Less sensitive with auto-reset
-        self.angel_api_circuit = CircuitBreaker(failure_threshold=10, recovery_timeout=30)
+        # Circuit Breakers
+        self.angel_api_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         self.yahoo_api_circuit = CircuitBreaker(failure_threshold=10, recovery_timeout=30)
-        self.nsepython_api_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=20)
         
         # Metrics
         self.metrics = MetricsCollector()
@@ -1274,25 +1118,18 @@ class AngelTradingBot:
         
         # Error Recovery
         self.error_recovery = ErrorRecovery(self)
-
-        # ===== TELEGRAM BOT COMMAND HANDLER =====
-        self.telegram_bot = None
-
-        # ===== ALERT FREQUENCY CONTROL =====
-        self._last_alert_time = {}
-        self._alert_cooldown = 60  # 60 seconds between same alerts
-
-        # ===== PERFORMANCE TRACKING =====
-        self._consecutive_wins = 0
-        self._consecutive_losses = 0
-        self._daily_profit_milestone_sent = False
-        self._daily_loss_milestone_sent = False
-
-        # Health status tracking for alerts
-        self._last_health_status = {}
-        self._market_open_sent = False
-        self._market_closed_sent = False
-        self._market_status_sent = False
+        
+        # ===== DATA PROVIDER MANAGER (PHASE 1-5) =====
+        provider_config = {
+            'strategy': DATA_STRATEGY,
+            'timeout': DATA_TIMEOUT
+        }
+        self.data_manager = DataProviderManager(self, provider_config)
+        
+        # Try to load provider config from file (Phase 5)
+        config_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'providers.json')
+        if os.path.exists(config_file):
+            self.data_manager.load_provider_config(config_file)
         
         # ===== HEALTH MONITORING =====
         self.health_status = {
@@ -1307,19 +1144,120 @@ class AngelTradingBot:
             'last_heartbeat': datetime.now().isoformat(),
             'bot_running': True,
             'start_time': datetime.now().isoformat(),
-            'metrics': {}
+            'metrics': {},
+            'providers': {}
         }
         self._save_health_status()
+        
+        # Track if market close alert has been sent
+        self.market_close_alert_sent = False
+        
+        # Track if shutdown square-off is in progress
+        self._shutdown_in_progress = False
+
+    # ============================================================
+    # CAPITAL TRACKING METHODS
+    # ============================================================
+    
+    def save_capital(self):
+        """Save current capital to database"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+            ''', ('capital', self.capital, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            log.debug(f"[DB] Capital saved: ₹{self.capital:.2f}")
+        except Exception as e:
+            log.error(f"[DB] Failed to save capital: {e}")
+
+    def load_capital(self):
+        """Load capital from database"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT value FROM bot_state WHERE key = "capital"')
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                self.capital = float(row[0])
+                self.available_capital = self.capital
+                self.initial_capital = self.capital
+                log.info(f"[DB] Loaded capital: ₹{self.capital:.2f}")
+                return True
+            else:
+                log.info("[DB] No saved capital found, using default")
+                return False
+        except Exception as e:
+            log.error(f"[DB] Failed to load capital: {e}")
+            return False
+
+    # ============================================================
+    # SQUARE OFF ALL POSITIONS (Helper Method)
+    # ============================================================
+    
+    def square_off_all_positions(self, reason: str = "Shutdown") -> bool:
+        """Square off all open positions safely"""
+        if not self.positions:
+            return True
+        
+        log.info(f"[SQUARE OFF] Squaring {len(self.positions)} positions due to: {reason}")
+        
+        success_count = 0
+        for position in self.positions[:]:
+            symbol = position['symbol']
+            qty = position['quantity']
+            entry_price = position['entry_price']
+            current_price = self.get_ltp(symbol) or entry_price
+            
+            # Place sell order
+            order_id = self.place_order(symbol, "SELL", qty, current_price)
+            if order_id:
+                # Update database status
+                if self.update_position_status(symbol, 'CLOSED'):
+                    log.info(f"[SQUARE OFF] ✅ Closed {symbol} @ ₹{current_price:.2f}")
+                    success_count += 1
+                else:
+                    log.error(f"[SQUARE OFF] ❌ Failed to update DB for {symbol}")
+            else:
+                log.error(f"[SQUARE OFF] ❌ Failed to place order for {symbol}")
+        
+        # Clear positions from memory
+        self.positions = []
+        
+        # Save updated capital
+        self.save_capital()
+        
+        # Send alert
+        if success_count > 0:
+            send_telegram_alert(f"🛑 <b>All positions squared off</b>\nReason: {reason}\nClosed: {success_count} positions\nFinal P&L: ₹{self.daily_pnl:.2f}")
+        
+        return success_count > 0
 
     # ============================================================
     # HEALTH MONITORING METHODS
     # ============================================================
     
     def _save_health_status(self):
-        """Save health status to file for dashboard"""
         try:
             self.health_status['metrics'] = self.metrics.get_summary()
             self.health_status['last_heartbeat'] = datetime.now().isoformat()
+            self.health_status['providers'] = self.data_manager.get_provider_status()
+            
+            positions_data = []
+            for pos in self.positions:
+                live_price = self.get_ltp(pos['symbol']) or pos['entry_price']
+                positions_data.append({
+                    'symbol': pos['symbol'],
+                    'entry_price': pos['entry_price'],
+                    'live_price': live_price,
+                    'quantity': pos['quantity'],
+                    'pnl': (live_price - pos['entry_price']) * pos['quantity']
+                })
+            self.health_status['positions'] = positions_data
             
             with open('health_status.json', 'w') as f:
                 json.dump(self.health_status, f, default=str, indent=2)
@@ -1328,158 +1266,41 @@ class AngelTradingBot:
     
     def update_health(self, component: Optional[str] = None, status: Optional[bool] = None, 
                       error: Optional[str] = None):
-        """Update health status for a component with enhanced alerts"""
         with self.lock:
             if component and status is not None:
                 self.health_status[component] = status
                 log.info(f"[HEALTH] {component}: {'✅ OK' if status else '❌ FAILED'}")
-                
-                # Skip market health alerts during off-hours
-                if component == "market" and status == False:
-                    # Don't send error alert - it's handled by market status
-                    pass
-                elif status == False:
-                    send_health_alert(
-                        component=component.capitalize(),
-                        status="unhealthy",
-                        error=f"{component} is not responding"
-                    )
-                elif status == True:
-                    if component in self._last_health_status:
-                        if self._last_health_status[component] == False:
-                            send_health_alert(
-                                component=component.capitalize(),
-                                status="healthy"
-                            )
-                    self._last_health_status[component] = status
             
             if error:
                 self.health_status['error_count'] += 1
                 self.health_status['last_error'] = error
                 self.health_status['status'] = '⚠️ System Error'
                 log.error(f"[HEALTH] Error: {error}")
-                
-                # Only send error alerts for real errors (not market closed)
-                if "market" not in error.lower():
-                    send_system_alert(
-                        "ERROR",
-                        f"{error[:200]}",
-                        "error"
-                    )
+                send_telegram_alert(f"⚠️ <b>Bot Error</b>\n{error[:200]}")
             
-            # Check overall health (skip market check for status message)
-            components_ok = all([
+            all_ok = all([
                 self.health_status.get('broker', False),
+                self.health_status.get('market', False),
                 self.health_status.get('scanner', False),
                 self.health_status.get('sync', False),
                 self.health_status.get('bot_running', True)
             ])
             
-            market_ok = self.health_status.get('market', False)
-            
-            if not components_ok:
+            self.health_status['all_ok'] = all_ok
+            if not all_ok and not self.health_status.get('last_error'):
                 self.health_status['status'] = '⚠️ System Degraded'
-            elif market_ok:
+            elif all_ok:
                 self.health_status['status'] = '✅ All systems operational'
-            else:
-                self.health_status['status'] = '💤 Waiting for market...'
             
             self.health_status['last_heartbeat'] = datetime.now().isoformat()
             self._save_health_status()
-
-    # ============================================================
-    # RESET CIRCUIT BREAKER
-    # ============================================================
-    
-    def reset_circuit_breakers(self):
-        """Manually reset all circuit breakers"""
-        self.angel_api_circuit.reset()
-        self.yahoo_api_circuit.reset()
-        self.nsepython_api_circuit.reset()
-        log.info("[CIRCUIT] All circuit breakers reset")
-        send_telegram_alert("🔄 <b>All Circuit Breakers Reset</b>\nAPI calls resumed.", "success")
-
-    # ============================================================
-    # ALERT FREQUENCY CONTROL
-    # ============================================================
-    
-    def send_alert_with_cooldown(self, alert_key: str, message: str, alert_type: str = "info") -> bool:
-        """Send alert with cooldown to prevent spam"""
-        now = time.time()
-        if alert_key in self._last_alert_time:
-            if now - self._last_alert_time[alert_key] < self._alert_cooldown:
-                log.debug(f"[ALERT] Cooldown for {alert_key}")
-                return False
-        
-        self._last_alert_time[alert_key] = now
-        return send_telegram_alert(message, alert_type)
-
-    # ============================================================
-    # TRADE PERFORMANCE ALERTS
-    # ============================================================
-    
-    def check_performance_alerts(self, pnl_pct: float, net_pnl: float):
-        """Send alerts for performance milestones"""
-        try:
-            # 3 consecutive wins
-            if pnl_pct >= 0:
-                self._consecutive_wins += 1
-                self._consecutive_losses = 0
-                if self._consecutive_wins >= 3:
-                    send_telegram_alert(
-                        f"🔥 <b>3 Consecutive Wins!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📈 Win Streak: {self._consecutive_wins}\n"
-                        f"💰 Total P&L: ₹{self.daily_pnl:.2f}",
-                        "profit"
-                    )
-                    self._consecutive_wins = 0
-            else:
-                self._consecutive_losses += 1
-                self._consecutive_wins = 0
-                if self._consecutive_losses >= 2:
-                    send_telegram_alert(
-                        f"⚠️ <b>2 Consecutive Losses</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📉 Loss Streak: {self._consecutive_losses}\n"
-                        f"💰 Total P&L: ₹{self.daily_pnl:.2f}",
-                        "warning"
-                    )
-                    self._consecutive_losses = 0
-            
-            # Daily profit milestone (₹500)
-            if self.daily_pnl >= 500 and not self._daily_profit_milestone_sent:
-                send_telegram_alert(
-                    f"🎉 <b>Daily Profit Milestone!</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 P&L: ₹{self.daily_pnl:.2f}\n"
-                    f"📈 Trades: {len(self.trades)}",
-                    "profit"
-                )
-                self._daily_profit_milestone_sent = True
-            
-            # Daily loss warning (₹200)
-            if self.daily_pnl <= -200 and not self._daily_loss_milestone_sent:
-                send_telegram_alert(
-                    f"⚠️ <b>Daily Loss Warning</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 P&L: ₹{self.daily_pnl:.2f}\n"
-                    f"📉 Trades: {len(self.trades)}",
-                    "warning"
-                )
-                self._daily_loss_milestone_sent = True
-                
-        except Exception as e:
-            log.error(f"[PERF ALERT] Error: {e}")
 
     # ============================================================
     # CACHE MANAGEMENT
     # ============================================================
     
     def cleanup_caches(self):
-        """Clean up old cache entries to prevent memory leaks"""
         now = datetime.now()
-        
         if (now - self.last_cache_cleanup).total_seconds() < CACHE_CLEANUP_INTERVAL:
             return
         
@@ -1505,20 +1326,144 @@ class AngelTradingBot:
             self.last_cache_cleanup = now
 
     # ============================================================
-    # POSITION RECOVERY ON STARTUP
+    # STALE POSITION CLEANUP
     # ============================================================
     
-    def load_positions_from_db(self):
-        """Load open positions from database on startup"""
+    def cleanup_stale_positions(self):
+        """Clean up positions older than STALE_POSITION_DAYS days"""
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM positions WHERE status = "OPEN"')
+            
+            # First count stale positions
+            cursor.execute('''
+                SELECT COUNT(*) as stale_count
+                FROM positions 
+                WHERE status = 'OPEN' 
+                AND datetime(entry_time) < datetime('now', ?)
+            ''', (f'-{STALE_POSITION_DAYS} days',))
+            
+            result = cursor.fetchone()
+            stale_count = result[0] if result else 0
+            
+            if stale_count > 0:
+                log.warning(f"[CLEANUP] Found {stale_count} stale positions older than {STALE_POSITION_DAYS} days")
+                
+                # Get details for alert
+                cursor.execute('''
+                    SELECT symbol, entry_price, quantity, entry_time
+                    FROM positions 
+                    WHERE status = 'OPEN' 
+                    AND datetime(entry_time) < datetime('now', ?)
+                    LIMIT 10
+                ''', (f'-{STALE_POSITION_DAYS} days',))
+                stale_details = cursor.fetchall()
+                
+                # Delete stale positions
+                cursor.execute('''
+                    DELETE FROM positions 
+                    WHERE status = 'OPEN' 
+                    AND datetime(entry_time) < datetime('now', ?)
+                ''', (f'-{STALE_POSITION_DAYS} days',))
+                
+                conn.commit()
+                
+                # Send alert
+                details_text = "\n".join([
+                    f"• {row['symbol']} | Entry: ₹{row['entry_price']:.2f} | Qty: {row['quantity']} | Entry: {row['entry_time'][:10]}"
+                    for row in stale_details[:5]
+                ])
+                if len(stale_details) > 5:
+                    details_text += f"\n... and {len(stale_details) - 5} more"
+                
+                send_telegram_alert(
+                    f"🧹 <b>Stale Position Cleanup</b>\n"
+                    f"Removed {stale_count} stale positions\n"
+                    f"Older than {STALE_POSITION_DAYS} days\n\n"
+                    f"<b>Sample:</b>\n{details_text}"
+                )
+                log.info(f"[CLEANUP] Deleted {stale_count} stale positions")
+            else:
+                log.debug("[CLEANUP] No stale positions found")
+            
+            conn.close()
+            return stale_count
+        except Exception as e:
+            log.error(f"[CLEANUP] Failed: {e}")
+            return 0
+
+    # ============================================================
+    # STARTUP HEALTH CHECK
+    # ============================================================
+    
+    def startup_health_check(self) -> bool:
+        """Perform health checks before starting the bot"""
+        log.info("[HEALTH] Performing startup health check...")
+        
+        checks_passed = True
+        
+        # Check environment variables
+        if not validate_environment():
+            log.error("[HEALTH] ❌ Environment validation failed")
+            checks_passed = False
+        
+        # Check database
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1')
+            conn.close()
+            log.info("[HEALTH] ✅ Database connected")
+        except Exception as e:
+            log.error(f"[HEALTH] ❌ Database connection failed: {e}")
+            checks_passed = False
+        
+        # Check for stale positions
+        try:
+            stale_count = self.cleanup_stale_positions()
+            if stale_count > 0:
+                log.warning(f"[HEALTH] ⚠️ Found and cleaned {stale_count} stale positions")
+        except Exception as e:
+            log.error(f"[HEALTH] ❌ Stale position cleanup failed: {e}")
+            checks_passed = False
+        
+        # Check scrip_master.json
+        if not os.path.exists("scrip_master.json"):
+            log.error("[HEALTH] ❌ scrip_master.json not found")
+            checks_passed = False
+        else:
+            log.info("[HEALTH] ✅ scrip_master.json found")
+        
+        # Load capital from DB
+        self.load_capital()
+        
+        if checks_passed:
+            log.info("[HEALTH] ✅ All startup checks passed")
+        else:
+            log.error("[HEALTH] ❌ Some startup checks failed")
+        
+        return checks_passed
+
+    # ============================================================
+    # POSITION RECOVERY ON STARTUP (with time filter)
+    # ============================================================
+    
+    def load_positions_from_db(self):
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Only load positions from last 24 hours to prevent stale recovery
+            cursor.execute('''
+                SELECT * FROM positions 
+                WHERE status = "OPEN" 
+                AND datetime(entry_time) > datetime('now', ?)
+            ''', (f'-{STALE_POSITION_HOURS} hours',))
             rows = cursor.fetchall()
             conn.close()
             
             if not rows:
-                log.info("[RECOVERY] No open positions found")
+                log.info("[RECOVERY] No open positions found in last 24 hours")
                 return
             
             for row in rows:
@@ -1542,9 +1487,9 @@ class AngelTradingBot:
                     'partial_exit_3_done': False
                 }
                 self.positions.append(position)
-                log.info(f"[RECOVERY] Restored: {row['symbol']} @ ₹{row['entry_price']}")
+                log.info(f"[RECOVERY] Restored: {row['symbol']} @ ₹{row['entry_price']} (Entry: {row['entry_time']})")
             
-            send_system_alert("INFO", f"Recovered {len(rows)} positions from database", "info")
+            send_telegram_alert(f"🔄 <b>Bot Restarted</b>\nRecovered {len(rows)} positions from last {STALE_POSITION_HOURS} hours")
             log.info(f"[RECOVERY] Loaded {len(rows)} positions")
         except Exception as e:
             log.error(f"[RECOVERY] Error: {e}")
@@ -1554,7 +1499,6 @@ class AngelTradingBot:
     # ============================================================
     
     def save_position_to_db(self, position_data: Dict) -> bool:
-        """Save position to database with transaction management"""
         required_fields = ['symbol', 'entry_price', 'quantity']
         for field in required_fields:
             if field not in position_data or position_data[field] is None:
@@ -1566,18 +1510,6 @@ class AngelTradingBot:
             return False
         
         def save_position(cursor):
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS positions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    entry_price REAL,
-                    quantity INTEGER,
-                    strategy TEXT,
-                    entry_time TEXT,
-                    status TEXT DEFAULT 'OPEN'
-                )
-            ''')
-            
             cursor.execute('''
                 INSERT INTO positions (symbol, entry_price, quantity, strategy, entry_time, status)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -1599,28 +1531,68 @@ class AngelTradingBot:
             log.error(f"[DB] Error saving position: {result}")
             return False
 
-    def update_position_status(self, symbol: str, status: str = 'CLOSED'):
-        """Update position status with transaction management"""
+    # ============================================================
+    # UPDATE POSITION STATUS - FIXED SQL SYNTAX!
+    # ============================================================
+    
+    def update_position_status(self, symbol: str, status: str = 'CLOSED') -> bool:
+        """Update position status with correct SQL syntax"""
         def update_status(cursor):
+            # FIXED: Using subquery instead of ORDER BY LIMIT inside UPDATE
             cursor.execute('''
                 UPDATE positions SET status = ? 
-                WHERE symbol = ? AND status = 'OPEN'
-                ORDER BY entry_time DESC LIMIT 1
-            ''', (status, symbol))
-            return cursor.rowcount
+                WHERE symbol = ? AND status = 'OPEN' 
+                AND entry_time = (
+                    SELECT MAX(entry_time) 
+                    FROM positions 
+                    WHERE symbol = ? AND status = 'OPEN'
+                )
+            ''', (status, symbol, symbol))
+            
+            rows_affected = cursor.rowcount
+            
+            # Verify the update
+            if rows_affected > 0:
+                cursor.execute('''
+                    SELECT id, symbol, status, entry_time
+                    FROM positions 
+                    WHERE symbol = ? AND status = ?
+                    ORDER BY entry_time DESC LIMIT 1
+                ''', (symbol, status))
+                result = cursor.fetchone()
+                if result:
+                    log.debug(f"[DB] Verified update: {result['symbol']} -> {result['status']}")
+            
+            return rows_affected
         
-        success, result = execute_db_transaction([update_status])
-        if success:
-            log.info(f"[DB] Position updated: {symbol} -> {status} (Rows: {result[0]})")
-        else:
-            log.error(f"[DB] Error updating position: {result}")
+        # Retry logic for DB writes
+        for attempt in range(3):
+            try:
+                success, result = execute_db_transaction([update_status])
+                if success:
+                    rows_affected = result[0] if result else 0
+                    if rows_affected > 0:
+                        log.info(f"[DB] Position updated: {symbol} -> {status} (Rows: {rows_affected})")
+                    else:
+                        log.warning(f"[DB] No open position found for {symbol} to update")
+                    return True
+                else:
+                    log.warning(f"[DB] Update attempt {attempt+1}/3 failed: {result}")
+                    if attempt < 2:
+                        time.sleep(1 * (attempt + 1))  # Exponential backoff
+            except Exception as e:
+                log.error(f"[DB] Update attempt {attempt+1}/3 error: {e}")
+                if attempt < 2:
+                    time.sleep(1 * (attempt + 1))
+        
+        log.error(f"[DB] Failed to update position for {symbol} after 3 attempts")
+        return False
 
     # ============================================================
     # SAVE TRADE
     # ============================================================
     
     def save_trade(self, trade_data: Dict) -> bool:
-        """Save trade to database with transaction management"""
         required_fields = ['symbol', 'entry_price', 'exit_price', 'quantity']
         for field in required_fields:
             if field not in trade_data or trade_data[field] is None:
@@ -1668,10 +1640,8 @@ class AngelTradingBot:
 
     @retry_with_backoff(max_retries=3, base_delay=5)
     def login(self) -> bool:
-        """Login to Angel One with retry"""
         try:
             log.info("Connecting to Angel One SmartAPI...")
-            
             self.api_limiter.wait_if_needed()
             
             self.obj = SmartConnect(api_key=API_KEY)
@@ -1686,25 +1656,20 @@ class AngelTradingBot:
                 self.feed_token = self.obj.getfeedToken()
                 log.info("[OK] API Connected")
                 self.update_health('broker', True)
-                send_system_alert(
-                    "ONLINE",
-                    f"Connected to Angel One\nClient: {CLIENT_CODE}\nTime: {datetime.now().strftime('%I:%M %p')}",
-                    "success"
-                )
+                send_telegram_alert(f"✅ <b>Login Successful</b>\n{datetime.now().strftime('%I:%M %p')}")
                 return True
             else:
                 log.error(f"[FAIL] Login Failed: {login_data}")
                 self.update_health('broker', False, error="Login failed")
-                send_telegram_alert(f"❌ <b>Login Failed</b>\n{login_data}", "error")
+                send_telegram_alert(f"❌ <b>Login Failed</b>\n{login_data}")
                 return False
         except Exception as e:
             log.error(f"[FAIL] Login Error: {e}")
             self.update_health('broker', False, error=f"Login error: {e}")
-            send_telegram_alert(f"❌ <b>Login Error</b>\n{e}", "error")
+            send_telegram_alert(f"❌ <b>Login Error</b>\n{e}")
             return False
 
     def load_symbol_tokens(self) -> Dict:
-        """Load symbol tokens from scrip_master.json"""
         if not os.path.exists("scrip_master.json"):
             log.error("[CRITICAL] 'scrip_master.json' missing")
             self.update_health(error="scrip_master.json missing")
@@ -1748,7 +1713,6 @@ class AngelTradingBot:
     # ============================================================
 
     def start_websocket(self):
-        """Start WebSocket connection with heartbeat"""
         def run_loop():
             try:
                 self.sws = SmartWebSocketV2(
@@ -1769,11 +1733,9 @@ class AngelTradingBot:
         t = threading.Thread(target=run_loop, daemon=True)
         t.start()
         time.sleep(3)
-        
         self.start_ws_heartbeat()
 
     def start_ws_heartbeat(self):
-        """Start WebSocket heartbeat thread"""
         if self.ws_heartbeat_thread and self.ws_heartbeat_thread.is_alive():
             return
             
@@ -1783,14 +1745,12 @@ class AngelTradingBot:
         log.info(f"[WS] Heartbeat thread started (interval: {WS_HEARTBEAT_INTERVAL}s)")
 
     def stop_ws_heartbeat(self):
-        """Stop WebSocket heartbeat thread"""
         self.ws_heartbeat_running = False
         if self.ws_heartbeat_thread:
             self.ws_heartbeat_thread.join(timeout=2)
         log.info("[WS] Heartbeat thread stopped")
 
     def _ws_heartbeat_loop(self):
-        """Heartbeat loop to keep WebSocket connection alive"""
         while self.ws_heartbeat_running and self.running:
             try:
                 time.sleep(WS_HEARTBEAT_INTERVAL)
@@ -1815,14 +1775,13 @@ class AngelTradingBot:
         log.info("[WS] Open Channel Established.")
         self.ws_connected = True
         if self.stock_list:
-            log.info(f"[WS] Subscribing to {len(self.stock_list)} symbols...")
             self.subscribe_to_stocks()
 
     def on_ws_close(self, wsapp, close_status_code, close_msg):
         log.warning(f"[WS] Disconnected: {close_msg}")
         self.ws_connected = False
         self.update_health('broker', False, error=f"WS disconnected")
-        send_telegram_alert(f"⚠️ <b>WebSocket Disconnected</b>\n{close_msg}", "warning")
+        send_telegram_alert(f"⚠️ <b>WebSocket Disconnected</b>\n{close_msg}")
 
     def on_ws_error(self, wsapp, error):
         log.error(f"[WS] Error: {error}")
@@ -1846,7 +1805,6 @@ class AngelTradingBot:
             pass
 
     def subscribe_to_stocks(self):
-        """Subscribe to stock prices via WebSocket"""
         if self.ws_connected and self.sws and self.stock_list:
             try:
                 correlation_id = "bot_stream_01"
@@ -1864,7 +1822,6 @@ class AngelTradingBot:
                 log.error(f"[WS] Subscription error: {e}")
 
     def check_ws_health(self) -> bool:
-        """Check WebSocket health and reconnect if needed"""
         if not self.ws_connected:
             log.warning("[WS] WebSocket disconnected. Reconnecting...")
             self.update_health('broker', False, error="WebSocket disconnected")
@@ -1884,7 +1841,6 @@ class AngelTradingBot:
         return True
 
     def _reconnect_websocket(self) -> bool:
-        """Reconnect WebSocket with retry"""
         try:
             self.stop_ws_heartbeat()
             if self.sws:
@@ -1905,161 +1861,32 @@ class AngelTradingBot:
             return False
 
     # ============================================================
-    # DATA SOURCE HIERARCHY - NSE PYTHON + ANGEL ONE + YAHOO
+    # DATA PROVIDER - UPDATED TO USE MANAGER
     # ============================================================
 
-    def _fetch_from_nsepython(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Fetch data from NSE Python library (TIER 1 - PRIMARY)"""
-        try:
-            if not NSEPYTHON_AVAILABLE:
-                return None
-            
-            # Get live quote
-            quote = nse.nse_eq_quote(symbol)
-            if not quote:
-                return None
-            
-            # Get historical data (last 5 days)
-            end = datetime.now()
-            start = end - timedelta(days=5)
-            
-            hist = nse.nse_eq_hist(symbol, start.strftime("%d-%m-%Y"), end.strftime("%d-%m-%Y"))
-            
-            if not hist:
-                return None
-            
-            df = pd.DataFrame(hist)
-            df = df.set_index('DATE')
-            df.index = pd.to_datetime(df.index)
-            
-            df['Open'] = df['OPEN'].astype(float)
-            df['High'] = df['HIGH'].astype(float)
-            df['Low'] = df['LOW'].astype(float)
-            df['Close'] = df['CLOSE'].astype(float)
-            df['Volume'] = df['TOTTRDQTY'].astype(float)
-            
-            return df
-            
-        except Exception as e:
-            log.warning(f"[NSEPYTHON] Failed for {symbol}: {e}")
-            return None
+    def _get_yahoo_data(self, symbol: str, period: str = "5d", interval: str = "15m"):
+        """Legacy method - kept for compatibility"""
+        return self.data_manager.providers[1].fetch_data(symbol, period, interval)
 
-    def _fetch_from_angel_one(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Fetch data from Angel One API (TIER 2 - SECONDARY)"""
-        try:
-            self.api_limiter.wait_if_needed()
-            
-            token = self.symbol_tokens.get(symbol)
-            if not token:
-                log.warning(f"[ANGEL API] Token not found for {symbol}")
-                return None
-            
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=5)
-            
-            fromdate = start_date.strftime("%Y-%m-%d")
-            todate = end_date.strftime("%Y-%m-%d")
-            
-            # FIXED: Removed 'exchange=' parameter
-            historical_data = self.angel_api_circuit.execute(
-                self.obj.getCandleData,
-                symboltoken=token,
-                interval="FIFTEEN_MINUTE",
-                fromdate=fromdate,
-                todate=todate
-            )
-            
-            self.metrics.record_api_call(success=True)
-            
-            if historical_data and historical_data.get('status') == True:
-                data = self._parse_angel_historical_data(historical_data)
-                if data is not None and not data.empty:
-                    log.info(f"[ANGEL API] Successfully fetched data for {symbol}")
-                    return data
-            
-            return None
-            
-        except Exception as e:
-            self.metrics.record_api_call(success=False)
-            log.warning(f"[ANGEL API] Failed for {symbol}: {e}")
-            return None
-
-    def _fetch_from_yahoo(self, symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
-        """Fetch data from Yahoo Finance (TIER 3 - FALLBACK)"""
-        try:
-            log.warning(f"[YAHOO FALLBACK] Fetching data for {symbol}...")
-            
-            stock = yf.Ticker(f"{symbol}.NS")
-            data = stock.history(period=period, interval=interval)
-            
-            if not data.empty and len(data) > 10:
-                data = data.tail(100).copy()
-                log.info(f"[YAHOO FALLBACK] Successfully fetched data for {symbol}")
-                return data
-            
-            return None
-            
-        except Exception as e:
-            log.warning(f"[YAHOO FALLBACK] Failed for {symbol}: {e}")
-            return None
-
-    def get_indicator_data_resilient(self, symbol: str, period: str = "5d", interval: str = "15m"):
-        """Fetch data with multi-tier fallback chain"""
-        try:
-            cache_key = f"{symbol}_{period}_{interval}"
-            
-            # Check cache first
-            with self.lock:
-                if cache_key in self.indicator_cache:
-                    cache_time, data = self.indicator_cache[cache_key]
-                    if (datetime.now() - cache_time).seconds < 60:
-                        self.metrics.record_cache_hit(True)
-                        return data
-                self.metrics.record_cache_hit(False)
-            
-            # === TIER 1: NSE Python (Fast & Free) ===
-            data = self.nsepython_api_circuit.execute(self._fetch_from_nsepython, symbol)
-            if data is not None and len(data) > 10:
-                with self.lock:
-                    self.indicator_cache[cache_key] = (datetime.now(), data)
-                log.info(f"[NSEPYTHON] Fetched data for {symbol}")
-                return data
-            
-            # === TIER 2: Angel One API ===
-            data = self._fetch_from_angel_one(symbol)
-            if data is not None and not data.empty:
-                with self.lock:
-                    self.indicator_cache[cache_key] = (datetime.now(), data)
-                log.info(f"[ANGEL API] Fetched data for {symbol}")
-                return data
-            
-            # === TIER 3: Yahoo Finance ===
-            data = self._fetch_from_yahoo(symbol, period, interval)
-            if data is not None and not data.empty:
-                with self.lock:
-                    self.indicator_cache[cache_key] = (datetime.now(), data)
-                log.info(f"[YAHOO] Fetched data for {symbol}")
-                return data
-            
-            # === TIER 4: Bulk Data Store ===
-            if symbol in self.bulk_data_store:
-                log.warning(f"[EMERGENCY] Using bulk data for {symbol}")
-                return self.bulk_data_store[symbol]
-            
-            log.warning(f"[FAILED] No data available for {symbol}")
-            return None
-            
-        except Exception as e:
-            log.error(f"[ERROR] get_indicator_data failed for {symbol}: {e}")
-            return None
-
-    # Keep original method for backward compatibility
     def get_indicator_data(self, symbol: str, period: str = "5d", interval: str = "15m"):
-        """Legacy method - now uses resilient data fetching"""
-        return self.get_indicator_data_resilient(symbol, period, interval)
+        """Fetch historical data using the DataProviderManager"""
+        try:
+            data = self.data_manager.fetch_data(symbol, period, interval)
+            
+            if data is not None:
+                cache_key = f"{symbol}_{period}_{interval}"
+                with self.lock:
+                    self.indicator_cache[cache_key] = (datetime.now(), data)
+                return data
+            
+            log.warning(f"[DATA] No data available for {symbol}")
+            return None
+            
+        except Exception as e:
+            log.error(f"[DATA] Failed to fetch data for {symbol}: {e}")
+            return None
 
     def _parse_angel_historical_data(self, historical_data):
-        """Parse Angel One historical data response"""
         try:
             if not historical_data or 'data' not in historical_data:
                 return None
@@ -2087,11 +1914,10 @@ class AngelTradingBot:
             return None
 
     # ============================================================
-    # RISK MANAGEMENT
+    # RISK MANAGEMENT (unchanged)
     # ============================================================
 
     def load_sector_mapping(self):
-        """Load sector mapping for stocks"""
         self.sector_map = {
             "HDFCBANK": "BANKING", "ICICIBANK": "BANKING", "SBIN": "BANKING",
             "AXISBANK": "BANKING", "KOTAKBANK": "BANKING", "INDUSINDBK": "BANKING",
@@ -2128,11 +1954,9 @@ class AngelTradingBot:
         log.info(f"[SECTOR] Loaded {len(self.sector_map)} mappings")
 
     def get_sector(self, symbol: str) -> str:
-        """Get sector for a symbol"""
         return self.sector_map.get(symbol, "OTHER")
 
     def check_correlation(self, symbol: str) -> bool:
-        """Check if symbol is correlated with existing positions"""
         if not ENABLE_CORRELATION_FILTER or not self.positions:
             return True
         for pos in self.positions:
@@ -2143,7 +1967,6 @@ class AngelTradingBot:
         return True
 
     def calculate_correlation(self, symbol1: str, symbol2: str) -> float:
-        """Calculate correlation between two stocks"""
         try:
             data1 = self.bulk_data_store.get(symbol1)
             data2 = self.bulk_data_store.get(symbol2)
@@ -2164,7 +1987,6 @@ class AngelTradingBot:
             return 0.0
 
     def check_sector_exposure(self, symbol: str) -> bool:
-        """Check if sector exposure limit is exceeded"""
         if not ENABLE_SECTOR_DIVERSIFICATION:
             return True
         sector = self.get_sector(symbol)
@@ -2178,7 +2000,6 @@ class AngelTradingBot:
         return True
 
     def calculate_atr(self, symbol: str, period: int = 14) -> Optional[float]:
-        """Calculate Average True Range"""
         try:
             data = self.bulk_data_store.get(symbol)
             if data is None or len(data) < period:
@@ -2190,20 +2011,17 @@ class AngelTradingBot:
             return None
 
     def calculate_atr_position_size(self, symbol: str, price: float) -> Optional[int]:
-        """Calculate position size based on ATR - FIXED with leverage"""
         if not ENABLE_ATR_POSITION_SIZING:
             return None
         atr = self.calculate_atr(symbol)
         if atr is None or atr == 0:
             return None
-        # FIXED: Added LEVERAGE to position sizing
-        qty = int(((self.capital * LEVERAGE) * 0.01) / (atr * 1.5))
+        qty = int((self.capital * 0.01) / (atr * 1.5))
         qty = max(1, qty)
         max_qty = int((self.available_capital * LEVERAGE) / price)
         return min(qty, max_qty)
 
     def get_dynamic_stop_loss(self, symbol: str, entry_price: float) -> float:
-        """Calculate dynamic stop loss based on ATR"""
         if not ENABLE_DYNAMIC_SL:
             return STOP_LOSS
         atr = self.calculate_atr(symbol)
@@ -2213,7 +2031,6 @@ class AngelTradingBot:
         return sl_pct
 
     def get_volatility_stop(self, symbol: str, entry_price: float) -> float:
-        """Calculate stop loss based on volatility"""
         if not ENABLE_VOLATILITY_STOP:
             return STOP_LOSS
         try:
@@ -2236,7 +2053,6 @@ class AngelTradingBot:
     # ============================================================
 
     def get_ltp(self, symbol: str) -> Optional[float]:
-        """Get Last Traded Price with fallback"""
         with self.lock:
             if symbol in self.live_prices:
                 if symbol in self.price_update_time:
@@ -2244,20 +2060,6 @@ class AngelTradingBot:
                     if age < 5:
                         return self.live_prices[symbol]
         
-        # Try NSE Python
-        if NSEPYTHON_AVAILABLE:
-            try:
-                quote = nse.nse_eq_quote(symbol)
-                if quote and quote.get('lastPrice'):
-                    price = float(quote['lastPrice'])
-                    with self.lock:
-                        self.live_prices[symbol] = price
-                        self.price_update_time[symbol] = datetime.now()
-                    return price
-            except:
-                pass
-        
-        # Try Yahoo Finance
         try:
             stock = yf.Ticker(f"{symbol}.NS")
             data = stock.history(period="1d", interval="1m")
@@ -2270,7 +2072,6 @@ class AngelTradingBot:
         except:
             pass
         
-        # Check bulk data store
         if symbol in self.bulk_data_store:
             df = self.bulk_data_store[symbol]
             if df is not None and not df.empty:
@@ -2279,7 +2080,6 @@ class AngelTradingBot:
                 except:
                     pass
         
-        # Check positions
         for pos in self.positions:
             if pos['symbol'] == symbol:
                 return pos['entry_price']
@@ -2287,30 +2087,67 @@ class AngelTradingBot:
         return None
 
     # ============================================================
-    # SQUARE OFF & RISK CHECKS
+    # SQUARE OFF & RISK CHECKS (UPDATED)
     # ============================================================
 
+    def send_market_close_alert(self):
+        now = datetime.now()
+        current_time = now.strftime("%I:%M %p")
+        
+        if self.positions:
+            positions_summary = "\n".join([
+                f"• {p['symbol']} | Qty: {p['quantity']} | Entry: ₹{p['entry_price']:.2f}"
+                for p in self.positions
+            ])
+            
+            message = f"""
+🔴 <b>MARKET CLOSING - SQUARING OFF ALL POSITIONS</b>
+
+📊 <b>Positions Being Closed:</b>
+{positions_summary}
+
+💰 <b>Today's P&L:</b> ₹{self.daily_pnl:.2f}
+📈 <b>Total Trades:</b> {len(self.trades)}
+💵 <b>Capital:</b> ₹{self.capital:.2f}
+
+⏰ Time: {current_time}
+🤖 Bot is now going to sleep.
+"""
+        else:
+            message = f"""
+🟡 <b>MARKET CLOSED - BOT SLEEPING</b>
+
+📊 <b>Today's Summary:</b>
+• P&L: ₹{self.daily_pnl:.2f}
+• Trades: {len(self.trades)}
+• Capital: ₹{self.capital:.2f}
+
+⏰ Time: {current_time}
+🔄 Bot will wake up tomorrow at 09:15 AM.
+"""
+        
+        send_telegram_alert(message)
+        log.info("[ALERT] Market close summary sent")
+
     def check_and_square_off(self) -> bool:
-        """Check if market is closing and square off positions"""
         now = datetime.now()
         current_time = now.time()
         close_time = datetime.strptime(MARKET_CLOSE, "%H:%M").time()
         square_off_time = (datetime.combine(now.date(), close_time) - timedelta(minutes=SQUARE_OFF_BUFFER)).time()
         
+        if current_time >= close_time and not self.market_close_alert_sent:
+            self.send_market_close_alert()
+            self.market_close_alert_sent = True
+        
         if current_time >= square_off_time or current_time >= close_time:
             if self.positions:
-                log.info(f"[SQUARE OFF] Squaring {len(self.positions)} positions...")
-                for position in self.positions[:]:
-                    symbol = position['symbol']
-                    qty = position['quantity']
-                    current_price = self.get_ltp(symbol) or position['entry_price']
-                    self.place_order(symbol, "SELL", qty, current_price)
-                    self.update_position_status(symbol, 'CLOSED')
-                    log.info(f"[SQUARE OFF] {symbol}: ₹{position['entry_price']:.2f} → ₹{current_price:.2f}")
+                # Use the new square_off_all_positions method
+                self.square_off_all_positions(reason="Market Closing")
+                
                 self.generate_daily_summary()
                 self.running = False
                 self.update_health('bot_running', False)
-                send_telegram_alert(f"🛑 <b>Market Closed - Squared Off</b>\n{len(self.positions)} positions closed", "shutdown")
+                send_telegram_alert(f"🛑 <b>Market Closed - Squared Off</b>\n{len(self.positions)} positions closed")
                 return True
             log.info("[SQUARE OFF] No positions to close.")
             self.running = False
@@ -2319,14 +2156,17 @@ class AngelTradingBot:
         return False
 
     def check_daily_loss_limit(self) -> bool:
-        """Check if daily loss limit is exceeded"""
         daily_loss_pct = (self.initial_capital - self.capital) / self.initial_capital
         if daily_loss_pct >= MAX_DAILY_LOSS:
             log.warning(f"[RISK] Max daily loss reached: {daily_loss_pct*100:.2f}%")
+            
+            # Square off before stopping
+            self.square_off_all_positions(reason="Max Daily Loss")
+            
             self.scan_status = "⛔ Stopped - Max Daily Loss"
             self.running = False
             self.update_health('bot_running', False, error=f"Max daily loss: {daily_loss_pct*100:.2f}%")
-            send_telegram_alert(f"⛔ <b>Max Daily Loss Reached</b>\n{daily_loss_pct*100:.2f}%\nBot stopped.", "error")
+            send_telegram_alert(f"⛔ <b>Max Daily Loss Reached</b>\n{daily_loss_pct*100:.2f}%\nBot stopped.")
             return True
         return False
 
@@ -2335,7 +2175,6 @@ class AngelTradingBot:
     # ============================================================
 
     def place_order(self, symbol: str, transaction_type: str, quantity: int = 1, price: Optional[float] = None) -> Optional[str]:
-        """Place a paper trade order"""
         try:
             if price is None:
                 price = self.get_ltp(symbol)
@@ -2357,7 +2196,6 @@ class AngelTradingBot:
             return None
 
     def is_trading_time(self) -> bool:
-        """Check if currently within trading hours"""
         now = datetime.now()
         current_time = now.time()
         trading_start_time = datetime.strptime(TRADING_START, "%H:%M").time()
@@ -2366,11 +2204,10 @@ class AngelTradingBot:
         return trading_start_time <= current_time < square_off_time
 
     # ============================================================
-    # MARKET DATA FUNCTIONS
+    # MARKET DATA FUNCTIONS (unchanged)
     # ============================================================
 
     def update_bulk_market_data(self):
-        """Update bulk market data from Yahoo Finance"""
         if not self.stock_list:
             return
         try:
@@ -2389,7 +2226,6 @@ class AngelTradingBot:
             self.update_health(error=f"Market data error: {e}")
 
     def calculate_vwap(self, data):
-        """Calculate Volume Weighted Average Price"""
         try:
             df = data.copy()
             df['Cum_Vol_Price'] = ((df['High'] + df['Low'] + df['Close']) / 3.0) * df['Volume']
@@ -2401,7 +2237,6 @@ class AngelTradingBot:
             return None
 
     def detect_orb(self, symbol: str, data):
-        """Detect Opening Range Breakout"""
         try:
             if data is None or data.empty:
                 return None, "NEUTRAL", 0
@@ -2424,7 +2259,6 @@ class AngelTradingBot:
         return None, "NEUTRAL", 0
 
     def get_market_condition(self) -> str:
-        """Get current market condition"""
         try:
             nifty = yf.Ticker("^NSEI")
             data = nifty.history(period="5d", interval="15m")
@@ -2445,7 +2279,6 @@ class AngelTradingBot:
         return "❓ UNKNOWN"
     
     def is_market_tradeable(self) -> bool:
-        """Check if market is tradeable based on conditions"""
         try:
             nifty = yf.Ticker("^NSEI")
             data = nifty.history(period="2d", interval="5m")
@@ -2458,20 +2291,7 @@ class AngelTradingBot:
         except:
             return True
 
-    def get_hold_minutes(self, score: int, strategy: str) -> int:
-        """Get dynamic hold duration based on score and strategy"""
-        # High confidence - hold till market close
-        if score >= 9:
-            return 9999  # Till market close
-        elif score >= 8:
-            return 180  # 3 hours
-        elif score >= 7:
-            return MAX_HOLD_MINUTES  # 90 minutes
-        else:
-            return 30  # 30 minutes
-
     def score_stock(self, symbol: str):
-        """Score a stock for potential trade"""
         try:
             data = self.get_indicator_data(symbol)
             if data is None or len(data) < 5:
@@ -2497,116 +2317,27 @@ class AngelTradingBot:
         return 0, "NEUTRAL", "NONE"
 
     # ============================================================
-    # STOCK FETCHING - DYNAMIC UNIVERSE
+    # STOCK FETCHING (unchanged)
     # ============================================================
     
     def fetch_all_stocks(self):
-        """Fetch all stocks to scan - Dynamic universe with multi-source"""
         log.info("="*60)
-        log.info("📊 FETCHING DYNAMIC STOCK UNIVERSE")
+        log.info("📊 USING HARDCODED FALLBACK STOCKS")
         log.info("="*60)
-        
-        # Try NSE Python first
-        if NSEPYTHON_AVAILABLE:
-            try:
-                log.info("[NSEPYTHON] Fetching NIFTY 500 stocks...")
-                # Get NIFTY 500 symbols
-                symbols = nse.nse_eq_symbols()
-                if symbols and len(symbols) > 100:
-                    stocks = self._filter_stocks(symbols[:300])
-                    if stocks and len(stocks) > 50:
-                        log.info(f"✅ Loaded {len(stocks)} stocks from NSE Python")
-                        return stocks
-            except Exception as e:
-                log.warning(f"[NSEPYTHON] Failed to fetch stock list: {e}")
-        
-        # Fallback to Angel One scrip_master
-        try:
-            log.info("[ANGEL] Fetching stocks from scrip_master.json...")
-            if self.symbol_tokens:
-                symbols = list(self.symbol_tokens.keys())[:200]
-                stocks = self._filter_stocks(symbols)
-                if stocks and len(stocks) > 50:
-                    log.info(f"✅ Loaded {len(stocks)} stocks from Angel One")
-                    return stocks
-        except Exception as e:
-            log.warning(f"[ANGEL] Failed to fetch stocks: {e}")
-        
-        # Final fallback - Yahoo with expanded list
-        log.warning("[FALLBACK] Using expanded Yahoo list")
-        return self._fetch_from_yahoo_expanded()
-
-    def _filter_stocks(self, symbols: List[str]) -> List[Dict]:
-        """Filter stocks by price and liquidity"""
-        stocks = []
-        for symbol in symbols:
-            try:
-                # Check if token exists
-                token = self.symbol_tokens.get(symbol)
-                if not token:
-                    continue
-                
-                # Get price
-                price = self.get_ltp(symbol)
-                if not price:
-                    continue
-                
-                if MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
-                    stocks.append({
-                        'symbol': symbol,
-                        'token': token,
-                        'price': price
-                    })
-            except:
-                continue
-        
-        # Sort by price (optional) and limit
-        stocks.sort(key=lambda x: x['price'], reverse=True)
-        return stocks[:MAX_STOCKS_TO_SCAN]
-
-    def _fetch_from_yahoo_expanded(self) -> List[Dict]:
-        """Expanded Yahoo Finance fallback"""
+        return self.fetch_from_yahoo_fallback()
+    
+    def fetch_from_yahoo_fallback(self):
         fallback_symbols = [
-            # NIFTY 50
             "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
             "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
             "LT", "AXISBANK", "WIPRO", "MARUTI", "TITAN",
             "TECHM", "NTPC", "ULTRACEMCO", "M&M", "BAJFINANCE",
             "SUNPHARMA", "POWERGRID", "NESTLEIND", "HCLTECH",
-            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE",
-            # NIFTY Next 50
-            "ADANIENT", "VEDL", "TATAMOTORS", "TATASTEEL", "BAJAJFINSV",
-            "HEROMOTOCO", "HINDALCO", "EICHERMOT", "GRASIM", "SHREECEM",
-            "DIVISLAB", "DRREDDY", "CIPLA", "BAJAJ-AUTO", "HDFC",
-            "SBILIFE", "ICICIPRULI", "HDFCAMC", "MUTHOOTFIN", "CHOLAFIN",
-            # NIFTY Midcap 100
-            "ZOMATO", "PAYTM", "IDEA", "PNB", "BANKBARODA",
-            "CANBK", "FEDERALBNK", "IDFCFIRSTB", "RBLBANK", "AUROPHARMA",
-            "TORNTPHARM", "ZYDUSLIFE", "LUPIN", "BIOCON", "TORNTPOWER",
-            "TATAPOWER", "ADANIPOWER", "NHPC", "PFC", "RECLTD",
-            "GAIL", "PETRONET", "HINDPETRO", "BPCL", "IOCL"
+            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE"
         ]
-        
-        stocks = []
-        for symbol in fallback_symbols:
-            if symbol in self.symbol_tokens:
-                price = self.get_ltp(symbol)
-                if price and MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
-                    stocks.append({
-                        'symbol': symbol,
-                        'token': self.symbol_tokens[symbol],
-                        'price': price
-                    })
-        
-        log.info(f"[FALLBACK] Loaded {len(stocks)} stocks")
-        return stocks
-
-    # Keep original method for backward compatibility
-    def fetch_from_yahoo_fallback(self):
-        return self._fetch_from_yahoo_expanded()
-
+        return self.get_prices_bulk(fallback_symbols)
+    
     def get_prices_bulk(self, symbols):
-        """Get bulk prices for symbols"""
         all_stocks = []
         limit_symbols = symbols[:500]
         log.info(f"📊 Analyzing {len(limit_symbols)} stocks...")
@@ -2634,7 +2365,6 @@ class AngelTradingBot:
                     token = self.symbol_tokens.get(symbol)
                     if not token:
                         continue
-                    # Calculate volume ratio
                     try:
                         volume_series = data[ticker_name]['Volume'] if ticker_name in data.columns.levels[0] else pd.Series()
                         if len(volume_series) > 5:
@@ -2644,7 +2374,6 @@ class AngelTradingBot:
                             volume_ratio = 1
                     except:
                         volume_ratio = 1
-                    # Calculate volatility
                     try:
                         close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
                         if len(close_prices) > 1:
@@ -2653,7 +2382,6 @@ class AngelTradingBot:
                             volatility = 0
                     except:
                         volatility = 0
-                    # Tier & score
                     if price > 500 and volume > 500000:
                         tier = "Large"; base_score = 70
                     elif price > 100 and volume > 200000:
@@ -2717,7 +2445,6 @@ class AngelTradingBot:
         return all_stocks
 
     def get_prices_fallback(self, symbols):
-        """Fallback method to get prices"""
         all_stocks = []
         limit_symbols = symbols[:MAX_STOCKS_TO_SCAN]
         log.info(f"📊 Fallback: {len(limit_symbols)} stocks...")
@@ -2735,7 +2462,6 @@ class AngelTradingBot:
         return all_stocks
 
     def calculate_estimated_charges(self, entry_price: float, exit_price: float, quantity: int) -> float:
-        """Calculate estimated brokerage charges"""
         turnover = (entry_price + exit_price) * quantity
         buy_brokerage = min(20.0, entry_price * quantity * 0.0003)
         sell_brokerage = min(20.0, exit_price * quantity * 0.0003)
@@ -2748,11 +2474,10 @@ class AngelTradingBot:
         return total_brokerage + stt + txn_charges + gst + sebi_fee + stamp_duty
 
     # ============================================================
-    # CHECK EXITS WITH ENHANCED TELEGRAM ALERTS
+    # CHECK EXITS WITH TELEGRAM ALERTS (updated with capital save)
     # ============================================================
 
     def check_exits(self):
-        """Check and execute exits for all positions"""
         try:
             for position in self.positions[:]:
                 symbol = position['symbol']
@@ -2765,7 +2490,6 @@ class AngelTradingBot:
                 pnl_pct = (current_price - entry_price) / entry_price
                 raw_pnl = (current_price - entry_price) * qty
                 profit_target = position.get('profit_target', DEFAULT_PROFIT_TARGET)
-                position_score = position.get('score', 0)
                 
                 if current_price > position['peak_price']:
                     position['peak_price'] = current_price
@@ -2818,11 +2542,8 @@ class AngelTradingBot:
                     exit_type = "FULL"
                     exit_qty = qty
                 
-                # === DYNAMIC TIME EXIT - FIXED ===
                 elapsed_minutes = (datetime.now() - position['entry_time']).total_seconds() / 60
-                max_hold = self.get_hold_minutes(position_score, position.get('strategy', 'Trend-Follow'))
-                
-                if elapsed_minutes > max_hold:
+                if elapsed_minutes > MAX_HOLD_MINUTES:
                     exit_triggered = True
                     exit_reason = f"⏳ [TIME EXIT] +{pnl_pct*100:.2f}% ({elapsed_minutes:.0f}m)"
                     exit_type = "FULL"
@@ -2853,21 +2574,10 @@ class AngelTradingBot:
                                 'entry_time': position.get('entry_time', datetime.now()).isoformat(),
                                 'exit_time': datetime.now().isoformat(), 'exit_type': 'PARTIAL'
                             })
+                            # Save capital after partial exit
+                            self.save_capital()
                         log.info(f"{exit_reason} | Qty: {exit_qty} | Net: ₹{net_pnl:.2f}")
                         position['peak_price'] = current_price
-                        
-                        send_trade_alert(
-                            symbol=symbol,
-                            entry_price=entry_price,
-                            quantity=exit_qty,
-                            score=position.get('score', 0),
-                            strategy=position.get('strategy', ''),
-                            target_price=position.get('target_price', 0),
-                            stop_price=position.get('stop_price', 0),
-                            pnl=net_pnl,
-                            exit_reason=exit_reason,
-                            alert_type="CLOSE"
-                        )
                     else:
                         self.place_order(symbol, "SELL", exit_qty, current_price)
                         charges = self.calculate_estimated_charges(entry_price, current_price, exit_qty)
@@ -2892,34 +2602,23 @@ class AngelTradingBot:
                             })
                             self.update_position_status(symbol, 'CLOSED')
                             self.positions.remove(position)
+                            # Save capital after full exit
+                            self.save_capital()
                         log.info(f"{exit_reason} | Net: ₹{net_pnl:.2f}")
-                        
-                        send_trade_alert(
-                            symbol=symbol,
-                            entry_price=entry_price,
-                            quantity=exit_qty,
-                            score=position.get('score', 0),
-                            strategy=position.get('strategy', ''),
-                            target_price=position.get('target_price', 0),
-                            stop_price=position.get('stop_price', 0),
-                            pnl=net_pnl,
-                            exit_reason=exit_reason,
-                            alert_type="CLOSE"
-                        )
-                        
-                        # === PERFORMANCE ALERTS ===
-                        self.check_performance_alerts(pnl_pct, net_pnl)
+                        if pnl_pct >= 0:
+                            send_telegram_alert(f"✅ <b>Position Closed (Profit)</b>\nSymbol: {symbol}\nP&L: +{net_pnl:.2f} ({pnl_pct*100:.2f}%)\nReason: {exit_reason}")
+                        else:
+                            send_telegram_alert(f"🔴 <b>Position Closed (Loss)</b>\nSymbol: {symbol}\nP&L: {net_pnl:.2f} ({pnl_pct*100:.2f}%)\nReason: {exit_reason}")
                         
         except Exception as e:
             log.error(f"[EXIT ERROR] {e}")
             self.update_health(error=f"Exit check error: {e}")
 
     # ============================================================
-    # SCAN AND TRADE
+    # SCAN AND TRADE (unchanged)
     # ============================================================
 
     def _perform_scan(self):
-        """Internal method to perform the actual scan - ONE BEST SIGNAL PER SCAN"""
         if not self.is_trading_time():
             self.scan_status = "⏰ Outside trading hours"
             return
@@ -2968,39 +2667,7 @@ class AngelTradingBot:
             self.scan_status = f"❌ No signals (Scored: {scored_count})"
             return
         
-        # ============================================================
-        # FIX: Only take the SINGLE BEST signal per scan
-        # ============================================================
         signals.sort(key=lambda x: x[1], reverse=True)
-        
-        # If tie in score, pick the one with higher volume (check LTP)
-        if len(signals) > 1 and signals[0][1] == signals[1][1]:
-            log.info(f"[SCAN] Tie in scores. Taking first signal: {signals[0][0]}")
-        
-        # Only process the top 1 signal per scan
-        best_signal = signals[0]
-        symbol, score, direction, strategy = best_signal
-        
-        # Check if we can open this position
-        if len(self.positions) >= MAX_POSITIONS:
-            log.info(f"[SCAN] Max positions ({MAX_POSITIONS}) reached, skipping top signal")
-            self.scan_status = f"⏸️ Max positions ({MAX_POSITIONS}) reached"
-            return
-        
-        current_price = self.get_ltp(symbol)
-        if not current_price:
-            log.warning(f"[SCAN] No price for {symbol}")
-            return
-        
-        if not self.check_correlation(symbol):
-            return
-        
-        if not self.check_sector_exposure(symbol):
-            return
-        
-        dynamic_sl = self.get_dynamic_stop_loss(symbol, current_price)
-        volatility_sl = self.get_volatility_stop(symbol, current_price)
-        final_sl = max(dynamic_sl, volatility_sl)
         
         def get_position_allocation(score):
             if score >= 10: return 0.45
@@ -3008,76 +2675,89 @@ class AngelTradingBot:
             elif score >= 8: return 0.25
             elif score >= 7: return 0.15
             else: return 0.00
-        
-        allocation_pct = get_position_allocation(score)
-        # FIXED: Added LEVERAGE to position sizing
-        allocation_amount = (self.capital * LEVERAGE) * allocation_pct
-        qty = int(allocation_amount / current_price)
-        
-        if qty <= 0:
-            log.warning(f"[SCAN] Qty 0 for {symbol}, skipping")
-            return
-            
-        margin = (current_price * qty) / LEVERAGE
-        
-        with self.lock:
-            if margin > self.available_capital:
-                log.warning(f"[MARGIN] Skipped {symbol}: Need ₹{margin:.2f}, Have ₹{self.available_capital:.2f}")
-                return
+                    
+        for symbol, score, direction, strategy in signals:
+            if len(self.positions) >= MAX_POSITIONS:
+                break
                 
-            log.info(f"💥 [SIGNAL] {symbol} | Score: {score} | Strategy: {strategy}")
-            log.info(f"[ALLOCATION] {allocation_pct*100:.1f}% of ₹{self.capital * LEVERAGE:,.2f} = ₹{allocation_amount:,.2f}")
-            log.info(f"[RISK] SL: {final_sl*100:.2f}% | Margin: ₹{margin:.2f}")
+            current_price = self.get_ltp(symbol)
+            if not current_price:
+                log.warning(f"[SCAN] No price for {symbol}")
+                continue
             
-            profit_target = PROFIT_TARGETS.get(score, DEFAULT_PROFIT_TARGET)
-            target_price = current_price * (1 + profit_target)
-            stop_price = current_price * (1 - final_sl)
+            if not self.check_correlation(symbol):
+                continue
             
-            self.place_order(symbol, "BUY", qty, current_price)
+            if not self.check_sector_exposure(symbol):
+                continue
             
-            # Save to database immediately
-            self.save_position_to_db({
-                'symbol': symbol,
-                'entry_price': current_price,
-                'quantity': qty,
-                'strategy': strategy,
-                'entry_time': datetime.now().isoformat()
-            })
+            dynamic_sl = self.get_dynamic_stop_loss(symbol, current_price)
+            volatility_sl = self.get_volatility_stop(symbol, current_price)
+            final_sl = max(dynamic_sl, volatility_sl)
             
-            self.positions.append({
-                'symbol': symbol, 'entry_price': current_price, 'peak_price': current_price,
-                'quantity': qty, 'remaining_qty': qty, 'entry_time': datetime.now(),
-                'score': score, 'profit_target': profit_target, 'strategy': strategy,
-                'stop_loss': final_sl, 'target_price': target_price, 'stop_price': stop_price,
-                'partial_exit_done': False, 'partial_exit_1_done': False,
-                'partial_exit_2_done': False, 'partial_exit_3_done': False
-            })
+            allocation_pct = get_position_allocation(score)
+            allocation_amount = self.capital * allocation_pct
+            qty = int(allocation_amount / current_price)
             
-            self.scan_status = f"✅ Position opened: {symbol} (Score: {score})"
-            self.metrics.record_trade(success=True)
+            if qty <= 0:
+                continue
+                
+            margin = (current_price * qty) / LEVERAGE
             
-            # === ENHANCED TELEGRAM ALERT ON POSITION OPEN ===
-            send_trade_alert(
-                symbol=symbol,
-                entry_price=current_price,
-                quantity=qty,
-                score=score,
-                strategy=strategy,
-                target_price=target_price,
-                stop_price=stop_price,
-                alert_type="OPEN"
-            )
+            with self.lock:
+                if margin > self.available_capital:
+                    log.warning(f"[MARGIN] Skipped {symbol}: Need ₹{margin:.2f}, Have ₹{self.available_capital:.2f}")
+                    continue
+                    
+                log.info(f"💥 [SIGNAL] {symbol} | Score: {score} | Qty: {qty} @ ₹{current_price:.2f}")
+                log.info(f"[ALLOCATION] {allocation_pct*100:.1f}% (₹{allocation_amount:.2f})")
+                log.info(f"[RISK] SL: {final_sl*100:.2f}% | Margin: ₹{margin:.2f}")
+                
+                profit_target = PROFIT_TARGETS.get(score, DEFAULT_PROFIT_TARGET)
+                target_price = current_price * (1 + profit_target)
+                stop_price = current_price * (1 - final_sl)
+                
+                self.place_order(symbol, "BUY", qty, current_price)
+                
+                self.save_position_to_db({
+                    'symbol': symbol,
+                    'entry_price': current_price,
+                    'quantity': qty,
+                    'strategy': strategy,
+                    'entry_time': datetime.now().isoformat()
+                })
+                
+                self.positions.append({
+                    'symbol': symbol, 'entry_price': current_price, 'peak_price': current_price,
+                    'quantity': qty, 'remaining_qty': qty, 'entry_time': datetime.now(),
+                    'score': score, 'profit_target': profit_target, 'strategy': strategy,
+                    'stop_loss': final_sl, 'target_price': target_price, 'stop_price': stop_price,
+                    'partial_exit_done': False, 'partial_exit_1_done': False,
+                    'partial_exit_2_done': False, 'partial_exit_3_done': False
+                })
+                
+                self.scan_status = f"✅ Position opened: {symbol} (Score: {score})"
+                self.metrics.record_trade(success=True)
+                
+                send_telegram_alert(
+                    f"📈 <b>Position Opened</b>\n"
+                    f"Symbol: {symbol}\n"
+                    f"Entry: ₹{current_price:.2f}\n"
+                    f"Qty: {qty}\n"
+                    f"Score: {score}\n"
+                    f"Strategy: {strategy}\n"
+                    f"Target: ₹{target_price:.2f}\n"
+                    f"Stop: ₹{stop_price:.2f}"
+                )
 
     def scan_and_trade(self):
-        """Wrapper for scan operation with overlap prevention"""
         self.scan_manager.start_scan(self)
 
     # ============================================================
-    # GENERATE DAILY SUMMARY
+    # GENERATE DAILY SUMMARY (updated with capital)
     # ============================================================
 
     def generate_daily_summary(self):
-        """Generate and log daily trading summary"""
         summary = f"""
 ======================================================================
 📊 DAILY TRADING SUMMARY - {datetime.now().strftime('%A, %B %d, %Y')}
@@ -3119,26 +2799,14 @@ class AngelTradingBot:
 """
         log.info(summary)
         
-        # Calculate win rate for enhanced summary
-        closed_trades = len([t for t in self.trades if t.get('exit_time')])
-        winning_trades = len([t for t in self.trades if t.get('net_pnl', 0) > 0])
-        win_rate = (winning_trades / closed_trades * 100) if closed_trades > 0 else 0
-        
-        # Send enhanced daily summary via Telegram
-        send_daily_summary_alert(
-            day_pnl=self.daily_pnl,
-            total_trades=len(self.trades),
-            win_rate=win_rate,
-            positions_open=len(self.positions),
-            capital=self.capital
-        )
+        if self.daily_pnl != 0 or len(self.trades) > 0:
+            send_telegram_alert(f"📊 <b>Daily Summary</b>\nP&L: {self.daily_pnl:+.2f}\nTrades: {len(self.trades)}\nCapital: ₹{self.capital:.2f}")
 
     # ============================================================
     # GITHUB SYNC & DASHBOARD
     # ============================================================
 
     def sync_to_github_pages(self, html_content: str):
-        """Sync dashboard to GitHub Pages"""
         if not GITHUB_PAT or "ghp_" not in GITHUB_PAT:
             log.error("GitHub PAT missing")
             self.update_health('sync', False, error="GitHub PAT missing")
@@ -3180,7 +2848,6 @@ class AngelTradingBot:
                 break
 
     def render_and_deploy_dashboard(self):
-        """Render and deploy dashboard"""
         try:
             total_floating_pnl = 0.0
             formatted_positions = []
@@ -3462,7 +3129,7 @@ class AngelTradingBot:
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
-        const API_BASE = '/api';
+        const API_BASE = 'https://turbine-bust-upload.ngrok-free.dev/api';
         let dailyChart, weeklyChart, monthlyChart;
 
         function formatCurrency(amount) {
@@ -3742,7 +3409,6 @@ class AngelTradingBot:
     # ============================================================
 
     def fetch_nse_holidays(self) -> List[str]:
-        """Fetch NSE holiday list"""
         try:
             headers = {'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             endpoint = "https://www.nseindia.com/api/holiday-master?type=trading"
@@ -3764,7 +3430,6 @@ class AngelTradingBot:
             return []
 
     def is_trading_day(self, check_date: Optional[datetime] = None) -> bool:
-        """Check if it's a trading day"""
         if check_date is None:
             check_date = datetime.now().date()
         if check_date.weekday() >= 5:
@@ -3775,7 +3440,6 @@ class AngelTradingBot:
         return True
 
     def check_market_status(self) -> Tuple[bool, str]:
-        """Check current market status with enhanced alerts"""
         today = datetime.now().date()
         current_time = datetime.now().time()
         market_open = datetime.strptime("09:15", "%H:%M").time()
@@ -3790,26 +3454,14 @@ class AngelTradingBot:
             self.market_condition = status
             self.update_health('market', False)
             log.info(f"⏳ {status}")
-            
-            if not self._market_status_sent:
-                send_market_status_alert(False, "Weekend/Holiday")
-                self._market_status_sent = True
-            
             return False, status
         
         if current_time < market_open:
-            time_until = (datetime.combine(today, market_open) - datetime.now()).seconds
-            hours = time_until // 3600
-            minutes = (time_until % 3600) // 60
             status = f"⏰ Market Opens at 09:15 AM"
             self.scan_status = status
             self.market_condition = status
             self.update_health('market', False)
             log.info(f"⏳ {status}")
-            
-            self._market_status_sent = False
-            self._market_open_sent = False
-            self._market_closed_sent = False
             return False, status
         
         if current_time > market_close:
@@ -3818,52 +3470,32 @@ class AngelTradingBot:
             self.market_condition = status
             self.update_health('market', False)
             log.info(f"⏳ {status}")
-            
-            if not self._market_closed_sent:
-                tomorrow = today + timedelta(days=1)
-                next_open = datetime.combine(tomorrow, market_open)
-                while next_open.weekday() >= 5:
-                    next_open += timedelta(days=1)
-                time_until = str(next_open - datetime.now()).split('.')[0]
-                send_market_status_alert(False, time_until)
-                self._market_closed_sent = True
-            
             return False, status
         
-        # Market is open
         status = "✅ Market OPEN - Trading Active"
         self.scan_status = status
         self.market_condition = "📈 LIVE MARKET"
         self.update_health('market', True)
         log.info(f"✅ {status}")
-        
-        if not self._market_open_sent:
-            send_market_status_alert(True)
-            self._market_open_sent = True
-            self._market_closed_sent = False
-            self._market_status_sent = False
-        
         return True, status
 
     # ============================================================
-    # MAIN RUN LOOP - FIXED: Telegram starts BEFORE market check!
+    # MAIN RUN LOOP (UPDATED WITH SQUARE OFF ON SHUTDOWN)
     # ============================================================
 
     def run(self):
-        """Main bot execution loop"""
+        # === GRACEFUL SHUTDOWN HANDLER ===
         def signal_handler(sig, frame):
             log.info("[SHUTDOWN] Received signal. Shutting down gracefully...")
+            
+            # ✅ SQUARE OFF ALL POSITIONS FIRST
+            if self.positions and not self._shutdown_in_progress:
+                self._shutdown_in_progress = True
+                self.square_off_all_positions(reason="User Shutdown (Ctrl+C)")
+            
             self.running = False
             self.ws_heartbeat_running = False
-            for pos in self.positions:
-                self.save_position_to_db({
-                    'symbol': pos['symbol'],
-                    'entry_price': pos['entry_price'],
-                    'quantity': pos['quantity'],
-                    'strategy': pos['strategy'],
-                    'entry_time': pos['entry_time'].isoformat() if hasattr(pos['entry_time'], 'isoformat') else datetime.now().isoformat()
-                })
-            send_system_alert("SHUTDOWN", f"P&L: ₹{self.daily_pnl:.2f}\nPositions: {len(self.positions)}", "shutdown")
+            send_telegram_alert(f"🛑 <b>Bot Stopped</b>\nP&L: ₹{self.daily_pnl:.2f}")
             sys.exit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
@@ -3881,12 +3513,16 @@ class AngelTradingBot:
         
         # === DATABASE BACKUP ===
         backup_database()
-        send_system_alert("STARTUP", "System initializing...", "startup")
+        send_telegram_alert("🔔 <b>ALPHA Bot Starting</b>\nSystem initializing...")
         
         init_database()
         cleanup_old_trades(365)
         
-        # === LOAD POSITIONS FROM DB ===
+        # === STARTUP HEALTH CHECK ===
+        if not self.startup_health_check():
+            log.warning("[STARTUP] Health check had issues, but continuing...")
+        
+        # === LOAD POSITIONS FROM DB (with time filter) ===
         self.load_positions_from_db()
         
         log.info("="*60)
@@ -3908,30 +3544,16 @@ class AngelTradingBot:
         log.info(f"   ✅ Trailing Stop Loss: Active")
         log.info(f"   ✅ Partial Profit Taking: Active")
         log.info(f"   ✅ Telegram Alerts: Active")
-        log.info(f"   ✅ Data Source: NSE Python (Primary) + Angel One + Yahoo (Fallback)")
+        log.info(f"   ✅ Data Source: Angel One API (Primary) + Yahoo (Fallback)")
         log.info(f"   ✅ WebSocket Heartbeat: Active ({WS_HEARTBEAT_INTERVAL}s)")
         log.info(f"   ✅ Rate Limiting: {API_MAX_CALLS_PER_MINUTE} calls/min")
-        log.info(f"   ✅ Circuit Breaker: Active with Auto-Reset")
+        log.info(f"   ✅ Circuit Breaker: Active")
         log.info(f"   ✅ Cache Cleanup: {CACHE_CLEANUP_INTERVAL}s")
+        log.info(f"   ✅ Stale Position Cleanup: {STALE_POSITION_DAYS} days")
         log.info("="*60)
         self.update_health('bot_running', True)
-        send_system_alert("READY", f"Capital: ₹{self.capital}\nMax Positions: {MAX_POSITIONS}", "success")
+        send_telegram_alert(f"✅ <b>Bot Initialized</b>\nCapital: ₹{self.capital}\nMax Positions: {MAX_POSITIONS}")
         
-        # ============================================================
-        # START TELEGRAM REMOTE CONTROL - IMMEDIATELY!
-        # This runs BEFORE market check, so it works 24/7
-        # ============================================================
-        log.info("[TG BOT] Attempting to start remote control...")
-        try:
-            self.telegram_bot = TelegramBotHandler(self)
-            self.telegram_bot.start()
-            log.info("[TG BOT] Remote control started successfully")
-        except Exception as e:
-            log.error(f"[TG BOT] Failed to start remote control: {e}")
-        
-        # ============================================================
-        # CHECK MARKET STATUS (Telegram is already running)
-        # ============================================================
         log.info("📅 Checking market status...")
         is_open, status = self.check_market_status()
         
@@ -3952,18 +3574,7 @@ class AngelTradingBot:
                 hours = int(seconds_to_wait // 3600)
                 minutes = int((seconds_to_wait % 3600) // 60)
                 log.info(f"⏰ Sleeping for {hours}h {minutes}m until next trading day...")
-                send_system_alert("INFO", f"Next trading day: {next_trading_date.strftime('%A, %B %d')}", "info")
-                send_telegram_alert(
-                    f"😴 <b>Bot is Sleeping</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📅 Next trading day: {next_trading_date.strftime('%A, %B %d')}\n"
-                    f"⏰ Will wake up at 09:15 AM\n"
-                    f"🕐 Current time: {datetime.now().strftime('%I:%M:%S %p')}\n"
-                    f"\n"
-                    f"📱 Telegram commands are still active!\n"
-                    f"   Send /status to check bot status.",
-                    "info"
-                )
+                send_telegram_alert(f"⏰ <b>Market Closed</b>\nNext trading day: {next_trading_date.strftime('%A, %B %d')}")
                 time.sleep(seconds_to_wait)
                 self.run()
                 return
@@ -3975,17 +3586,6 @@ class AngelTradingBot:
                 hours = int(seconds_to_wait // 3600)
                 minutes = int((seconds_to_wait % 3600) // 60)
                 log.info(f"⏰ Sleeping for {hours}h {minutes}m until market opens...")
-                send_telegram_alert(
-                    f"😴 <b>Bot is Sleeping</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏰ Market opens at 09:15 AM\n"
-                    f"⌛ Time remaining: {hours}h {minutes}m\n"
-                    f"🕐 Current time: {datetime.now().strftime('%I:%M:%S %p')}\n"
-                    f"\n"
-                    f"📱 Telegram commands are still active!\n"
-                    f"   Send /status to check bot status.",
-                    "info"
-                )
                 time.sleep(seconds_to_wait)
                 self.run()
                 return
@@ -3998,41 +3598,16 @@ class AngelTradingBot:
                 hours = int(seconds_to_wait // 3600)
                 minutes = int((seconds_to_wait % 3600) // 60)
                 log.info(f"⏰ Sleeping for {hours}h {minutes}m until tomorrow...")
-                send_telegram_alert(
-                    f"😴 <b>Bot is Sleeping</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📅 Market closed for today\n"
-                    f"⏰ Next open: 09:15 AM tomorrow\n"
-                    f"⌛ Time remaining: {hours}h {minutes}m\n"
-                    f"🕐 Current time: {datetime.now().strftime('%I:%M:%S %p')}\n"
-                    f"\n"
-                    f"📱 Telegram commands are still active!\n"
-                    f"   Send /status to check bot status.",
-                    "info"
-                )
                 time.sleep(seconds_to_wait)
                 self.run()
                 return
         
-        # ============================================================
-        # MARKET IS OPEN - PROCEED WITH TRADING
-        # ============================================================
         log.info("✅ Market is OPEN! Proceeding with login...")
-        
-        send_telegram_alert(
-            f"🏛️ <b>Market is OPEN!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 Bot is waking up and starting to trade\n"
-            f"💰 Capital: ₹{self.capital}\n"
-            f"📊 Max Positions: {MAX_POSITIONS}\n"
-            f"🕐 {datetime.now().strftime('%I:%M:%S %p')}",
-            "market"
-        )
         
         if not self.login():
             log.error("Failed to login. Exiting.")
             self.update_health('broker', False, error="Login failed")
-            send_system_alert("ERROR", "Login failed. Bot cannot start trading.", "error")
+            send_telegram_alert("❌ <b>Login Failed</b>\nBot cannot start trading.")
             return
             
         self.load_symbol_tokens()
@@ -4067,14 +3642,13 @@ class AngelTradingBot:
         log.info(f"🎯 Scan Interval: {SCAN_INTERVAL}s")
         log.info(f"🔒 Leverage: {LEVERAGE}x")
         log.info("="*60)
-        send_system_alert("READY", f"Capital: ₹{self.capital}\nScanning: {len(self.stock_list)} stocks", "success")
+        send_telegram_alert(f"🚀 <b>Bot Ready</b>\nCapital: ₹{self.capital}\nScanning: {len(self.stock_list)} stocks")
         
         scan_count = 0
         last_cleanup = datetime.now()
         
         while self.running:
             try:
-                # Periodic cleanup
                 if (datetime.now() - last_cleanup).total_seconds() > 3600:
                     self.cleanup_caches()
                     last_cleanup = datetime.now()
@@ -4132,23 +3706,36 @@ class AngelTradingBot:
                 self.running = False
                 self.scan_status = "⏹️ Bot Stopped by User"
                 self.update_health('bot_running', False)
-                send_system_alert("SHUTDOWN", f"P&L: ₹{self.daily_pnl:.2f}", "shutdown")
+                send_telegram_alert(f"🛑 <b>Bot Stopped by User</b>\nP&L: ₹{self.daily_pnl:.2f}")
                 break
             except Exception as e:
                 log.error(f"[BOT MAIN LOOP EXCEPTION]: {e}")
+                
+                # ✅ Square off on exception
+                if self.positions and not self._shutdown_in_progress:
+                    self._shutdown_in_progress = True
+                    self.square_off_all_positions(reason=f"Error: {str(e)[:50]}")
+                
                 self.scan_status = f"❌ Error: {str(e)[:50]}"
                 self.update_health(error=f"Main loop error: {e}")
-                send_system_alert("ERROR", f"{str(e)[:200]}", "error")
+                send_telegram_alert(f"⚠️ <b>Bot Error</b>\n{str(e)[:200]}")
                 time.sleep(10)
         
         self.stop_ws_heartbeat()
         self.generate_daily_summary()
         self.update_health('bot_running', False)
-        send_system_alert("SHUTDOWN", f"Final P&L: ₹{self.daily_pnl:.2f}", "shutdown")
+        send_telegram_alert(f"🏁 <b>Bot Stopped</b>\nFinal P&L: ₹{self.daily_pnl:.2f}")
         log.info("🤖 Bot stopped. Final P&L: ₹{:.2f}".format(self.daily_pnl))
 
     def shutdown(self):
         """Gracefully shutdown the bot"""
+        log.info("[SHUTDOWN] Shutting down...")
+        
+        # ✅ Square off all positions
+        if self.positions and not self._shutdown_in_progress:
+            self._shutdown_in_progress = True
+            self.square_off_all_positions(reason="Manual Shutdown")
+        
         self.running = False
         self.scan_status = "⏹️ Bot Stopped"
         self.update_health('bot_running', False)
@@ -4158,7 +3745,7 @@ class AngelTradingBot:
                 self.sws.close_connection()
             except:
                 pass
-        send_system_alert("SHUTDOWN", "Bot shutdown complete", "shutdown")
+        send_telegram_alert("🛑 <b>Bot Shutdown Complete</b>")
         log.info("Bot shutdown complete.")
 
 

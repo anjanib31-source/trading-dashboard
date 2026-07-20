@@ -4,6 +4,9 @@ Production-ready with logging, rate limiting, health checks, and CORS
 ✅ FIXED: Increased rate limit to 120 requests/min
 ✅ FIXED: Better error handling
 ✅ ADDED: /api/data endpoint for consolidated dashboard data
+✅ ADDED: Provider status endpoint /api/providers
+✅ FIXED: Health status reading from correct path
+✅ FIXED: CORS for production
 """
 
 from flask import Flask, jsonify, send_from_directory, request
@@ -26,7 +29,7 @@ load_dotenv()
 # === CONFIGURATION ===
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), 'trades.db'))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))  # Increased from 60 to 120
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 PORT = int(os.getenv("PORT", 5000))
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -446,13 +449,10 @@ def get_market_status():
             is_open = False
         elif current_time < market_open_time:
             open_datetime = datetime.combine(now.date(), market_open_time)
-            if current_time < market_open_time:
-                time_diff = open_datetime - now
-                hours = time_diff.seconds // 3600
-                minutes = (time_diff.seconds % 3600) // 60
-                status = f'⏰ Market Opens at {market_open_time.strftime("%I:%M %p")} ({hours}h {minutes}m)'
-            else:
-                status = f'⏰ Market Opens at {market_open_time.strftime("%I:%M %p")}'
+            time_diff = open_datetime - now
+            hours = time_diff.seconds // 3600
+            minutes = (time_diff.seconds % 3600) // 60
+            status = f'⏰ Market Opens at {market_open_time.strftime("%I:%M %p")} ({hours}h {minutes}m)'
             is_open = False
         elif current_time >= market_open_time and current_time < market_close_time:
             status = '🟢 Market Open'
@@ -506,7 +506,8 @@ def get_health():
                     'error_count': 1,
                     'last_heartbeat': datetime.now().isoformat(),
                     'bot_running': False,
-                    'start_time': datetime.now().isoformat()
+                    'start_time': datetime.now().isoformat(),
+                    'providers': {}
                 },
                 'timestamp': datetime.now().isoformat()
             })
@@ -516,6 +517,32 @@ def get_health():
             'status': 'error',
             'message': str(e)
         }), 500
+
+@app.route('/api/providers')
+@rate_limit
+def get_providers():
+    """Get data provider status from health_status.json"""
+    try:
+        health_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'health_status.json')
+        if os.path.exists(health_file):
+            with open(health_file, 'r') as f:
+                health_data = json.load(f)
+            
+            providers = health_data.get('providers', {})
+            return jsonify({
+                'status': 'success',
+                'data': providers,
+                'timestamp': datetime.now().isoformat()
+            })
+        else:
+            return jsonify({
+                'status': 'success',
+                'data': {},
+                'timestamp': datetime.now().isoformat()
+            })
+    except Exception as e:
+        log.error(f"Error in get_providers: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/health/live')
 def live_health():
