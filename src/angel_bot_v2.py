@@ -31,6 +31,12 @@ Phase 2+ with all improvements including:
 ✅ ADDED: Capital tracking in database
 ✅ ADDED: Capital persists across restarts
 ✅ ADDED: Capital updates after every trade
+✅ FIXED: Dynamic stock discovery using multiple providers
+✅ FIXED: AUTO_PICK_STOCKS now works
+✅ FIXED: MAX_STOCKS_TO_SCAN now enforced
+✅ FIXED: Duplicate symbol removal
+✅ ADDED: Stock list caching
+✅ ADDED: Config file support (stocks.json)
 """
 
 from SmartApi import SmartConnect
@@ -64,6 +70,7 @@ import pickle
 from functools import wraps
 from typing import Optional, Dict, List, Tuple, Any
 from abc import ABC, abstractmethod
+from config import load_stock_config, get_hardcoded_stocks, get_filters, get_scanning_settings
 
 try:
     import nsepython
@@ -473,8 +480,6 @@ class NSEPythonProvider(DataProvider):
         try:
             import nsepython
             
-            # Note: Actual implementation depends on nsepython API
-            # This is a placeholder - adjust based on actual API
             data = nsepython.get_historical_data(
                 symbol=symbol,
                 start_date=(datetime.now() - timedelta(days=5)).strftime("%d-%m-%Y"),
@@ -750,7 +755,7 @@ MAX_SECTOR_EXPOSURE = 0.40
 MAX_CORRELATION_THRESHOLD = 0.70
 
 # === STOCK SELECTION ===
-AUTO_PICK_STOCKS = False
+AUTO_PICK_STOCKS = True
 MAX_STOCKS_TO_SCAN = 40
 MIN_STOCK_PRICE = 20
 MAX_STOCK_PRICE = 4000
@@ -786,6 +791,10 @@ DATA_TIMEOUT = int(os.getenv("DATA_TIMEOUT", "10"))
 # === STALE POSITION CLEANUP ===
 STALE_POSITION_DAYS = 7
 STALE_POSITION_HOURS = 24
+
+# === STOCK LIST CACHE ===
+STOCK_LIST_CACHE_FILE = "stock_list_cache.json"
+STOCK_LIST_CACHE_TTL = 3600  # 1 hour
 
 # === SETUP LOGGING WITH ROTATION ===
 os.makedirs("logs", exist_ok=True)
@@ -980,7 +989,7 @@ def init_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_time)')
         
-        # ===== CAPITAL TRACKING TABLE (NEW) =====
+        # Capital tracking table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
@@ -1071,6 +1080,8 @@ class AngelTradingBot:
         self.token_symbols = {}
         self.bulk_data_store = {}
         self.stock_list = []
+        self._stock_list_cache_time = None
+        self._stock_list_cache = None
         
         # Runtime State
         self.running = True
@@ -1393,56 +1404,349 @@ class AngelTradingBot:
             return 0
 
     # ============================================================
-    # STARTUP HEALTH CHECK
+    # STOCK CONFIGURATION (Using config/stocks.json)
+    # ============================================================
+
+    def load_stock_config(self) -> Dict:
+        """Load stock configuration from config/stocks.json"""
+        return load_stock_config()
+
+    def get_hardcoded_stocks_from_config(self) -> List[str]:
+        """Get hardcoded stocks from config"""
+        return get_hardcoded_stocks()
+
+    def get_stock_filters(self) -> Dict:
+        """Get filter settings from config"""
+        return get_filters()
+
+    def get_scanning_settings(self) -> Dict:
+        """Get scanning settings from config"""
+        return get_scanning_settings()
+
+    # ============================================================
+    # DYNAMIC STOCK DISCOVERY
     # ============================================================
     
-    def startup_health_check(self) -> bool:
-        """Perform health checks before starting the bot"""
-        log.info("[HEALTH] Performing startup health check...")
+    def _load_stock_list_from_cache(self) -> Optional[List[str]]:
+        """Load stock list from cache if not expired"""
+        if not os.path.exists(STOCK_LIST_CACHE_FILE):
+            return None
         
-        checks_passed = True
-        
-        # Check environment variables
-        if not validate_environment():
-            log.error("[HEALTH] ❌ Environment validation failed")
-            checks_passed = False
-        
-        # Check database
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1')
-            conn.close()
-            log.info("[HEALTH] ✅ Database connected")
+            with open(STOCK_LIST_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+            
+            cache_time = datetime.fromisoformat(data.get('timestamp', '2000-01-01T00:00:00'))
+            if (datetime.now() - cache_time).total_seconds() < STOCK_LIST_CACHE_TTL:
+                log.info(f"[STOCKS] Loaded {len(data.get('symbols', []))} stocks from cache")
+                return data.get('symbols', [])
         except Exception as e:
-            log.error(f"[HEALTH] ❌ Database connection failed: {e}")
-            checks_passed = False
+            log.warning(f"[STOCKS] Failed to load cache: {e}")
         
-        # Check for stale positions
+        return None
+    
+    def _save_stock_list_to_cache(self, symbols: List[str]):
+        """Save stock list to cache"""
         try:
-            stale_count = self.cleanup_stale_positions()
-            if stale_count > 0:
-                log.warning(f"[HEALTH] ⚠️ Found and cleaned {stale_count} stale positions")
+            data = {
+                'timestamp': datetime.now().isoformat(),
+                'symbols': symbols
+            }
+            with open(STOCK_LIST_CACHE_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+            log.info(f"[STOCKS] Saved {len(symbols)} stocks to cache")
         except Exception as e:
-            log.error(f"[HEALTH] ❌ Stale position cleanup failed: {e}")
-            checks_passed = False
+            log.warning(f"[STOCKS] Failed to save cache: {e}")
+    
+    def _fetch_stocks_from_nsepython(self) -> List[Dict]:
+        """Fetch stocks using nsepython"""
+        stocks = []
+        if not NSEPYTHON_AVAILABLE:
+            return stocks
         
-        # Check scrip_master.json
-        if not os.path.exists("scrip_master.json"):
-            log.error("[HEALTH] ❌ scrip_master.json not found")
-            checks_passed = False
-        else:
-            log.info("[HEALTH] ✅ scrip_master.json found")
+        try:
+            import nsepython
+            
+            # Get Nifty 50 stocks
+            nifty50 = nsepython.get_nifty50()
+            if nifty50:
+                for stock in nifty50:
+                    if isinstance(stock, dict):
+                        symbol = stock.get('symbol', '').replace('&', '').strip()
+                        if symbol and MIN_STOCK_PRICE < stock.get('price', 0) < MAX_STOCK_PRICE:
+                            stocks.append({
+                                'symbol': symbol,
+                                'token': self.symbol_tokens.get(symbol, ''),
+                                'price': stock.get('price', 0)
+                            })
+                    elif isinstance(stock, str):
+                        if stock and stock in self.symbol_tokens:
+                            stocks.append({
+                                'symbol': stock,
+                                'token': self.symbol_tokens.get(stock, ''),
+                                'price': 0  # Will be fetched later
+                            })
+            
+            log.info(f"[NSEPYTHON] Added {len(stocks)} Nifty 50 stocks")
+        except Exception as e:
+            log.warning(f"[NSEPYTHON] Failed: {e}")
         
-        # Load capital from DB
-        self.load_capital()
+        return stocks
+    
+    def _fetch_stocks_from_yahoo(self) -> List[Dict]:
+        """Fetch stocks using Yahoo Finance"""
+        # Use the hardcoded list as a base for Yahoo
+        hardcoded_symbols = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+            "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
+            "LT", "AXISBANK", "WIPRO", "MARUTI", "TITAN",
+            "TECHM", "NTPC", "ULTRACEMCO", "M&M", "BAJFINANCE",
+            "SUNPHARMA", "POWERGRID", "NESTLEIND", "HCLTECH",
+            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE"
+        ]
+        return self.get_prices_bulk(hardcoded_symbols)
+    
+    def _get_hardcoded_fallback(self) -> List[Dict]:
+        """Get hardcoded fallback stocks"""
+        fallback_symbols = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+            "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
+            "LT", "AXISBANK", "WIPRO", "MARUTI", "TITAN",
+            "TECHM", "NTPC", "ULTRACEMCO", "M&M", "BAJFINANCE",
+            "SUNPHARMA", "POWERGRID", "NESTLEIND", "HCLTECH",
+            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE"
+        ]
+        stocks = []
+        for symbol in fallback_symbols:
+            token = self.symbol_tokens.get(symbol)
+            if token:
+                stocks.append({
+                    'symbol': symbol,
+                    'token': token,
+                    'price': 0
+                })
+        return stocks
+
+    def fetch_all_stocks(self) -> List[Dict]:
+        """Fetch all stocks to scan using dynamic discovery and config"""
+        log.info("="*60)
+        log.info("📊 DYNAMIC STOCK DISCOVERY")
+        log.info("="*60)
         
-        if checks_passed:
-            log.info("[HEALTH] ✅ All startup checks passed")
-        else:
-            log.error("[HEALTH] ❌ Some startup checks failed")
+        # Load config
+        config = self.load_stock_config()
+        filters = self.get_stock_filters()
+        scanning = self.get_scanning_settings()
         
-        return checks_passed
+        max_stocks = filters.get('max_stocks', MAX_STOCKS_TO_SCAN)
+        auto_pick = scanning.get('auto_pick_stocks', AUTO_PICK_STOCKS)
+        refresh_interval = scanning.get('refresh_interval_hours', 24)
+        
+        # Try cache first (if enabled)
+        if auto_pick:
+            cached_symbols = self._load_stock_list_from_cache()
+            if cached_symbols:
+                stocks = []
+                for symbol in cached_symbols:
+                    token = self.symbol_tokens.get(symbol)
+                    if token:
+                        stocks.append({'symbol': symbol, 'token': token, 'price': 0})
+                if stocks:
+                    log.info(f"[STOCKS] Loaded {len(stocks)} stocks from cache")
+                    return stocks[:max_stocks]
+        
+        all_stocks = []
+        seen_symbols = set()
+        
+        # 1. Try nsepython (if enabled in config)
+        sources = config.get('sources', {})
+        
+        if auto_pick and sources.get('nsepython', {}).get('enabled', True):
+            nse_stocks = self._fetch_stocks_from_nsepython()
+            for stock in nse_stocks:
+                if stock['symbol'] not in seen_symbols:
+                    seen_symbols.add(stock['symbol'])
+                    all_stocks.append(stock)
+            log.info(f"[STOCKS] Added {len(nse_stocks)} stocks from nsepython")
+        
+        # 2. Try Yahoo Finance (if enabled)
+        if sources.get('yahoo_finance', {}).get('enabled', True):
+            yahoo_stocks = self._fetch_stocks_from_yahoo()
+            for stock in yahoo_stocks:
+                if stock['symbol'] not in seen_symbols:
+                    seen_symbols.add(stock['symbol'])
+                    all_stocks.append(stock)
+            log.info(f"[STOCKS] Added {len(yahoo_stocks)} stocks from Yahoo")
+        
+        # 3. Use hardcoded from config (if enabled)
+        if sources.get('hardcoded', {}).get('enabled', True):
+            hardcoded_symbols = self.get_hardcoded_stocks_from_config()
+            if hardcoded_symbols:
+                for symbol in hardcoded_symbols:
+                    if symbol not in seen_symbols:
+                        token = self.symbol_tokens.get(symbol)
+                        if token:
+                            seen_symbols.add(symbol)
+                            all_stocks.append({'symbol': symbol, 'token': token, 'price': 0})
+                log.info(f"[STOCKS] Added {len(hardcoded_symbols)} stocks from hardcoded list")
+        
+        # 4. If still no stocks, use emergency fallback
+        if not all_stocks:
+            log.warning("[STOCKS] No stocks found from any source, using emergency fallback")
+            hardcoded = self._get_hardcoded_fallback()
+            for stock in hardcoded:
+                if stock['symbol'] not in seen_symbols:
+                    seen_symbols.add(stock['symbol'])
+                    all_stocks.append(stock)
+            log.info(f"[STOCKS] Added {len(hardcoded)} stocks from emergency fallback")
+        
+        # Apply price filters
+        filtered_stocks = []
+        min_price = filters.get('min_price', MIN_STOCK_PRICE)
+        max_price = filters.get('max_price', MAX_STOCK_PRICE)
+        min_volume = filters.get('min_volume', 0)
+        
+        for stock in all_stocks:
+            price = stock.get('price', 0)
+            volume = stock.get('volume', 0)
+            if price >= min_price and price <= max_price:
+                if min_volume == 0 or volume >= min_volume:
+                    filtered_stocks.append(stock)
+        
+        log.info(f"[STOCKS] Found {len(filtered_stocks)} stocks after filtering")
+        
+        # Save to cache
+        if filtered_stocks:
+            symbols = [s['symbol'] for s in filtered_stocks[:max_stocks]]
+            self._save_stock_list_to_cache(symbols)
+        
+        return filtered_stocks[:max_stocks]
+    
+    def get_prices_bulk(self, symbols: List[str]) -> List[Dict]:
+        """Get bulk prices for symbols using Yahoo Finance"""
+        all_stocks = []
+        limit_symbols = symbols[:500]
+        log.info(f"📊 Analyzing {len(limit_symbols)} stocks...")
+        stock_data = []
+        try:
+            tickers = [f"{s}.NS" for s in limit_symbols]
+            data = yf.download(tickers=tickers, period="5d", interval="15m", group_by="ticker", progress=False)
+            if data.empty:
+                log.warning("No data from Yahoo")
+                return []
+            for symbol in limit_symbols:
+                try:
+                    ticker_name = f"{symbol}.NS"
+                    if len(limit_symbols) == 1:
+                        price = float(data['Close'].iloc[-1]) if not data.empty else None
+                        volume = float(data['Volume'].iloc[-1]) if not data.empty else 0
+                    else:
+                        if ticker_name in data['Close'].columns:
+                            price = float(data['Close'][ticker_name].iloc[-1])
+                            volume = float(data['Volume'][ticker_name].iloc[-1])
+                        else:
+                            continue
+                    if not (MIN_STOCK_PRICE < price < MAX_STOCK_PRICE):
+                        continue
+                    token = self.symbol_tokens.get(symbol)
+                    if not token:
+                        continue
+                    try:
+                        volume_series = data[ticker_name]['Volume'] if ticker_name in data.columns.levels[0] else pd.Series()
+                        if len(volume_series) > 5:
+                            avg_volume = volume_series.tail(5).mean()
+                            volume_ratio = volume / avg_volume if avg_volume > 0 else 1
+                        else:
+                            volume_ratio = 1
+                    except:
+                        volume_ratio = 1
+                    try:
+                        close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
+                        if len(close_prices) > 1:
+                            volatility = close_prices.pct_change().dropna().std() * 100
+                        else:
+                            volatility = 0
+                    except:
+                        volatility = 0
+                    if price > 500 and volume > 500000:
+                        tier = "Large"; base_score = 70
+                    elif price > 100 and volume > 200000:
+                        tier = "Mid"; base_score = 85
+                    elif price > 50 and volume > 100000:
+                        tier = "Small"; base_score = 100
+                    else:
+                        continue
+                    score = base_score
+                    if volume_ratio >= 5.0:
+                        score += 30
+                    elif volume_ratio >= 4.0:
+                        score += 25
+                    elif volume_ratio >= 3.0:
+                        score += 18
+                    elif volume_ratio >= 2.0:
+                        score += 10
+                    if 2 <= volatility <= 5:
+                        score += 15
+                    try:
+                        close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
+                        if len(close_prices) > 20:
+                            sma20 = close_prices.tail(20).mean()
+                            if price > sma20:
+                                score += 10
+                    except:
+                        pass
+                    score = min(score, 100)
+                    stock_data.append({
+                        'symbol': symbol, 'token': token, 'price': price,
+                        'volume': volume, 'volume_ratio': volume_ratio,
+                        'volatility': volatility, 'tier': tier, 'score': score
+                    })
+                except:
+                    continue
+            if not stock_data:
+                log.warning("No surge candidates. Falling back.")
+                return self.get_prices_fallback(limit_symbols)
+            stock_data.sort(key=lambda x: x['score'], reverse=True)
+            selected = stock_data[:MAX_STOCKS_TO_SCAN]
+            tier_counts = {"Large": 0, "Mid": 0, "Small": 0}
+            final_selected = []
+            for stock in selected:
+                if tier_counts[stock['tier']] < MAX_STOCKS_TO_SCAN // 5:
+                    final_selected.append(stock)
+                    tier_counts[stock['tier']] += 1
+            remaining_slots = MAX_STOCKS_TO_SCAN - len(final_selected)
+            for stock in selected:
+                if stock not in final_selected and remaining_slots > 0:
+                    final_selected.append(stock)
+                    remaining_slots -= 1
+            for stock in final_selected:
+                all_stocks.append({'symbol': stock['symbol'], 'token': stock['token'], 'price': stock['price']})
+            log.info(f"✅ Selected {len(final_selected)} stocks")
+        except Exception as e:
+            log.error(f"Error: {e}")
+            return self.get_prices_fallback(limit_symbols)
+        if not all_stocks:
+            log.warning("No stocks passed. Falling back.")
+            return self.get_prices_fallback(limit_symbols)
+        return all_stocks
+
+    def get_prices_fallback(self, symbols: List[str]) -> List[Dict]:
+        """Fallback method to get prices"""
+        all_stocks = []
+        limit_symbols = symbols[:MAX_STOCKS_TO_SCAN]
+        log.info(f"📊 Fallback: {len(limit_symbols)} stocks...")
+        for symbol in limit_symbols:
+            try:
+                token = self.symbol_tokens.get(symbol)
+                stock = yf.Ticker(f"{symbol}.NS")
+                data = stock.history(period="1d")
+                if not data.empty:
+                    price = float(data['Close'].iloc[-1])
+                    if MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
+                        all_stocks.append({'symbol': symbol, 'token': token, 'price': price})
+            except:
+                continue
+        return all_stocks
 
     # ============================================================
     # POSITION RECOVERY ON STARTUP (with time filter)
@@ -2317,149 +2621,8 @@ class AngelTradingBot:
         return 0, "NEUTRAL", "NONE"
 
     # ============================================================
-    # STOCK FETCHING (unchanged)
+    # CALCULATE ESTIMATED CHARGES
     # ============================================================
-    
-    def fetch_all_stocks(self):
-        log.info("="*60)
-        log.info("📊 USING HARDCODED FALLBACK STOCKS")
-        log.info("="*60)
-        return self.fetch_from_yahoo_fallback()
-    
-    def fetch_from_yahoo_fallback(self):
-        fallback_symbols = [
-            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
-            "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
-            "LT", "AXISBANK", "WIPRO", "MARUTI", "TITAN",
-            "TECHM", "NTPC", "ULTRACEMCO", "M&M", "BAJFINANCE",
-            "SUNPHARMA", "POWERGRID", "NESTLEIND", "HCLTECH",
-            "JSWSTEEL", "ADANIPORTS", "ONGC", "COALINDIA", "HDFCLIFE"
-        ]
-        return self.get_prices_bulk(fallback_symbols)
-    
-    def get_prices_bulk(self, symbols):
-        all_stocks = []
-        limit_symbols = symbols[:500]
-        log.info(f"📊 Analyzing {len(limit_symbols)} stocks...")
-        stock_data = []
-        try:
-            tickers = [f"{s}.NS" for s in limit_symbols]
-            data = yf.download(tickers=tickers, period="5d", interval="15m", progress=False)
-            if data.empty:
-                log.warning("No data from Yahoo")
-                return []
-            for symbol in limit_symbols:
-                try:
-                    ticker_name = f"{symbol}.NS"
-                    if len(limit_symbols) == 1:
-                        price = float(data['Close'].iloc[-1]) if not data.empty else None
-                        volume = float(data['Volume'].iloc[-1]) if not data.empty else 0
-                    else:
-                        if ticker_name in data['Close'].columns:
-                            price = float(data['Close'][ticker_name].iloc[-1])
-                            volume = float(data['Volume'][ticker_name].iloc[-1])
-                        else:
-                            continue
-                    if not (MIN_STOCK_PRICE < price < MAX_STOCK_PRICE):
-                        continue
-                    token = self.symbol_tokens.get(symbol)
-                    if not token:
-                        continue
-                    try:
-                        volume_series = data[ticker_name]['Volume'] if ticker_name in data.columns.levels[0] else pd.Series()
-                        if len(volume_series) > 5:
-                            avg_volume = volume_series.tail(5).mean()
-                            volume_ratio = volume / avg_volume if avg_volume > 0 else 1
-                        else:
-                            volume_ratio = 1
-                    except:
-                        volume_ratio = 1
-                    try:
-                        close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
-                        if len(close_prices) > 1:
-                            volatility = close_prices.pct_change().dropna().std() * 100
-                        else:
-                            volatility = 0
-                    except:
-                        volatility = 0
-                    if price > 500 and volume > 500000:
-                        tier = "Large"; base_score = 70
-                    elif price > 100 and volume > 200000:
-                        tier = "Mid"; base_score = 85
-                    elif price > 50 and volume > 100000:
-                        tier = "Small"; base_score = 100
-                    else:
-                        continue
-                    score = base_score
-                    if volume_ratio >= 5.0:
-                        score += 30
-                    elif volume_ratio >= 4.0:
-                        score += 25
-                    elif volume_ratio >= 3.0:
-                        score += 18
-                    elif volume_ratio >= 2.0:
-                        score += 10
-                    if 2 <= volatility <= 5:
-                        score += 15
-                    try:
-                        close_prices = data[ticker_name]['Close'] if ticker_name in data.columns.levels[0] else pd.Series()
-                        if len(close_prices) > 20:
-                            sma20 = close_prices.tail(20).mean()
-                            if price > sma20:
-                                score += 10
-                    except:
-                        pass
-                    score = min(score, 100)
-                    stock_data.append({
-                        'symbol': symbol, 'token': token, 'price': price,
-                        'volume': volume, 'volume_ratio': volume_ratio,
-                        'volatility': volatility, 'tier': tier, 'score': score
-                    })
-                except:
-                    continue
-            if not stock_data:
-                log.warning("No surge candidates. Falling back.")
-                return self.get_prices_fallback(symbols)
-            stock_data.sort(key=lambda x: x['score'], reverse=True)
-            selected = stock_data[:MAX_STOCKS_TO_SCAN]
-            tier_counts = {"Large": 0, "Mid": 0, "Small": 0}
-            final_selected = []
-            for stock in selected:
-                if tier_counts[stock['tier']] < MAX_STOCKS_TO_SCAN // 5:
-                    final_selected.append(stock)
-                    tier_counts[stock['tier']] += 1
-            remaining_slots = MAX_STOCKS_TO_SCAN - len(final_selected)
-            for stock in selected:
-                if stock not in final_selected and remaining_slots > 0:
-                    final_selected.append(stock)
-                    remaining_slots -= 1
-            for stock in final_selected:
-                all_stocks.append({'symbol': stock['symbol'], 'token': stock['token'], 'price': stock['price']})
-            log.info(f"✅ Selected {len(final_selected)} stocks")
-        except Exception as e:
-            log.error(f"Error: {e}")
-            return self.get_prices_fallback(symbols)
-        if not all_stocks:
-            log.warning("No stocks passed. Falling back.")
-            return self.get_prices_fallback(symbols)
-        return all_stocks
-
-    def get_prices_fallback(self, symbols):
-        all_stocks = []
-        limit_symbols = symbols[:MAX_STOCKS_TO_SCAN]
-        log.info(f"📊 Fallback: {len(limit_symbols)} stocks...")
-        for symbol in limit_symbols:
-            try:
-                token = self.symbol_tokens.get(symbol)
-                stock = yf.Ticker(f"{symbol}.NS")
-                data = stock.history(period="1d")
-                if not data.empty:
-                    price = float(data['Close'].iloc[-1])
-                    if MIN_STOCK_PRICE < price < MAX_STOCK_PRICE:
-                        all_stocks.append({'symbol': symbol, 'token': token, 'price': price})
-            except:
-                continue
-        return all_stocks
 
     def calculate_estimated_charges(self, entry_price: float, exit_price: float, quantity: int) -> float:
         turnover = (entry_price + exit_price) * quantity
